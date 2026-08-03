@@ -1,0 +1,12 @@
+.env
+.venv
+.pytest_cache
+.ruff_cache
+.docker-empty
+data
+output
+paper
+web/node_modules
+web/.next
+**/__pycache__
+*.pyc
