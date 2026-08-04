@@ -13,7 +13,14 @@ from scholarrag.domain.models import Answer, RetrievedChunk
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer, StageStatus, TraceEvent
 from scholarrag.rag.service import SYSTEM_PROMPT, RAGService
+from scholarrag.rag.visual_routing import (
+    load_quality_reports,
+    merge_routing_decisions,
+    visual_routing_policy,
+)
+from scholarrag.rag.visuals import build_multimodal_content
 from scholarrag.retrieval.service import RetrievalService
+from scholarrag.storage.catalog import Catalog
 
 
 class AgentPlan(BaseModel):
@@ -344,15 +351,26 @@ class AgenticRAGService:
                 limitation = (
                     "证据缺口检测未完全通过，必须明确指出无法覆盖的范围。" if not sufficient else ""
                 )
+                prompt_text = (
+                    f"问题：{question}\n\n{limitation}\n"
+                    f"请综合多步检索证据回答，不要输出规划过程。\n\n证据：\n{contexts}"
+                )
+                reports = load_quality_reports(
+                    Catalog(self.settings),
+                    {item.chunk.document_id for item in retrieved},
+                )
+                routing = merge_routing_decisions(
+                    [visual_routing_policy(report) for report in reports]
+                )
+                visual = build_multimodal_content(
+                    prompt_text,
+                    retrieved,
+                    self.settings,
+                    force=routing.force_visual,
+                )
                 messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"问题：{question}\n\n{limitation}\n"
-                            f"请综合多步检索证据回答，不要输出规划过程。\n\n证据：\n{contexts}"
-                        ),
-                    },
+                    {"role": "user", "content": visual.parts},
                 ]
                 if events:
                     parts: list[str] = []
@@ -404,7 +422,14 @@ class AgenticRAGService:
                     usage = response.data.get("usage") or {}
                     provider_trace_id = response.trace_id
                 stage.complete(
-                    output={"answer_chars": len(answer_text), "usage": usage},
+                    output={
+                        "answer_chars": len(answer_text),
+                        "usage": usage,
+                        "visual_images_included": visual.images_included,
+                        "visual_images_skipped": visual.images_skipped,
+                        "visual_force": routing.force_visual,
+                        "visual_routing_reasons": routing.reasons,
+                    },
                     trace={"provider_trace_id": provider_trace_id},
                     summary=f"综合生成 {len(answer_text)} 字符",
                 )

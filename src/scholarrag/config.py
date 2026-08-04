@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     parse_quality_review_score: float = Field(default=0.65, ge=0, le=1)
     parse_fallback_mode: Literal["off", "on_fallback", "on_review"] = "on_review"
     parse_route_min_score_improvement: float = Field(default=0.03, ge=0, le=1)
+    # When a figure/table block has a bounding box but no extracted image (parser
+    # failed to export the image), render the region straight from the source PDF.
+    ingest_visual_backfill: bool = True
 
     siliconflow_api_key: SecretStr | None = Field(
         default=None,
@@ -65,6 +68,12 @@ class Settings(BaseSettings):
     agent_max_steps: int = Field(default=4, ge=1, le=8)
     agent_timeout_seconds: float = Field(default=180, ge=10, le=900)
     agent_max_context_chars: int = Field(default=48_000, ge=4_000, le=200_000)
+    # Visual evidence: attach block images (figures/tables) to generation messages
+    # so the vision LLM reads them directly instead of relying on lossy OCR text.
+    # No per-request image-count budget: every distinct figure/table image among
+    # the retrieved chunks is attached, for answer quality over cost.
+    chat_include_visual_evidence: bool = True
+    chat_visual_max_edge: int = Field(default=1024, ge=128, le=4096)
     ragas_judge_model: str = "Qwen/Qwen3.6-27B"
     ragas_judge_context_window_tokens: int = 262_144
     ragas_judge_enable_thinking: bool = True

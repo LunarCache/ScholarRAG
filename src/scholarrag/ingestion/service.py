@@ -14,6 +14,7 @@ from scholarrag.ingestion.mineru_normalizer import MinerUNormalizer
 from scholarrag.ingestion.paddleocr_normalizer import PaddleOCRNormalizer
 from scholarrag.ingestion.quality import ParseQualityGate, ParseQualityReport
 from scholarrag.ingestion.routing import ParseRouteDecision, ParseRouter
+from scholarrag.ingestion.visual_backfill import VisualEvidenceBackfill
 from scholarrag.knowledge.service import MetadataExtractor
 from scholarrag.providers.mineru import MinerUClient
 from scholarrag.providers.paddleocr import PaddleOCRAPIClient
@@ -245,6 +246,8 @@ class IngestionService:
         manifest: dict[str, Any],
     ) -> ParseCandidate:
         chunks = SemanticChunker().chunk(document)
+        if self.settings.ingest_visual_backfill:
+            VisualEvidenceBackfill().fill(chunks, document, preserved_source, parse_dir / "visual")
         canonical_path = parse_dir / "canonical" / "document.json"
         chunks_path = parse_dir / "chunks" / "chunks.json"
         self.store.write_json(canonical_path, document.model_dump(mode="json"))

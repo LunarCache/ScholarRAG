@@ -13,7 +13,8 @@ from pydantic import BaseModel, Field
 
 from scholarrag.config import Settings
 from scholarrag.domain.models import Answer
-from scholarrag.rag.runs import EventSink, PipelineTracer
+from scholarrag.evaluation.visual_metrics import extract_visual_usage
+from scholarrag.rag.runs import EventSink, PipelineTracer, QueryRunStore
 from scholarrag.rag.service import RAGService
 from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
@@ -95,6 +96,7 @@ class RagasEvaluator:
                 answer=answer,
             )
         )
+        metrics.update(self._visual_metrics(parent_query_run_id))
         run_id = f"eval_{uuid.uuid4().hex}"
         artifact = self.settings.data_dir / "evaluations" / f"{run_id}.json"
         run = EvaluationRun(
@@ -358,6 +360,27 @@ class RagasEvaluator:
             )
         )
         return metrics
+
+    def _visual_metrics(self, run_id: str | None) -> dict[str, MetricScore]:
+        """Visual usage counters from the query run that produced this answer.
+
+        Answers generated without a recorded query run (e.g. CLI evaluation)
+        have no visual metrics to report.
+        """
+        store = QueryRunStore(self.settings)
+        run = store.get(run_id) if run_id else None
+        if run is None:
+            return {}
+        events = [event.model_dump() for event in store.list_events(run.run_id)]
+        usage = extract_visual_usage(events)
+        return {
+            "visual_images_included": MetricScore(
+                value=usage.included, reason="生成阶段实际携带的图片数"
+            ),
+            "visual_images_skipped": MetricScore(
+                value=usage.skipped, reason="因图片加载失败跳过的图片数"
+            ),
+        }
 
 
 def load_cases(path: Path) -> list[EvaluationCase]:

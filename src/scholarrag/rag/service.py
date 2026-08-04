@@ -15,7 +15,14 @@ from scholarrag.domain.models import (
 from scholarrag.observability import current_trace_id, get_tracer
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer
+from scholarrag.rag.visual_routing import (
+    load_quality_reports,
+    merge_routing_decisions,
+    visual_routing_policy,
+)
+from scholarrag.rag.visuals import build_multimodal_content, default_prompt
 from scholarrag.retrieval.service import RetrievalService
+from scholarrag.storage.catalog import Catalog
 
 SYSTEM_PROMPT = """你是严谨的论文阅读助手。只能根据给出的证据回答。
 要求：
@@ -128,12 +135,27 @@ class RAGService:
                 with get_tracer().start_as_current_span("rag.generate") as span:
                     span.set_attribute("gen_ai.request.model", self.settings.chat_model)
                     span.set_attribute("rag.context_count", len(retrieved))
+                    reports = load_quality_reports(
+                        Catalog(self.settings),
+                        {item.chunk.document_id for item in retrieved},
+                    )
+                    routing = merge_routing_decisions(
+                        [visual_routing_policy(report) for report in reports]
+                    )
+                    span.set_attribute("rag.visual_force", routing.force_visual)
+                    if routing.force_visual:
+                        span.set_attribute(
+                            "rag.visual_routing_reasons", "; ".join(routing.reasons)
+                        )
+                    visual = build_multimodal_content(
+                        default_prompt(question, contexts),
+                        retrieved,
+                        self.settings,
+                        force=routing.force_visual,
+                    )
                     messages = [
                         {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": f"问题：{question}\n\n证据：\n{contexts}",
-                        },
+                        {"role": "user", "content": visual.parts},
                     ]
                     generation_usage: dict[str, object] = {}
                     if events:
@@ -195,6 +217,10 @@ class RAGService:
                         "answer_chars": len(answer_text),
                         "usage": generation_usage,
                         "estimated_cost_cny": estimated_cost,
+                        "visual_images_included": visual.images_included,
+                        "visual_images_skipped": visual.images_skipped,
+                        "visual_force": routing.force_visual,
+                        "visual_routing_reasons": routing.reasons,
                     },
                     trace={"provider_trace_id": generation_trace_id},
                     summary=f"生成 {len(answer_text)} 字符",

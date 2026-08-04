@@ -54,6 +54,7 @@ ScholarRAG 将解析版本、检索候选、Agent 步骤、模型调用、引用
 - **细粒度引用**：回答中的 `[C#]` 可定位到 claim、evidence span、chunk/block、页码和 bbox，并跳回原 PDF 页面。
 - **实时执行轨迹**：异步 Query Run、追加式事件日志、SSE、断线重连、取消、终态对账和历史恢复。
 - **自动评测**：Ragas 0.4、检索/排序指标、引用完整性指标，以及独立的持久化 Judge 任务。
+- **视觉证据闭环**：OCR 负责定位与引用，VLM 在生成阶段直接读取图/表块图片（含 bbox 渲染兜底与质量路由门控），弥补公式、表格、复杂图表的文本损失；检索命中的图/表图片不设数量上限，全部附带以保证回答质量。
 - **可观测与可部署**：OpenTelemetry、Phoenix、质量/时延/费用看板、Docker Compose、备份校验和容量基准。
 
 ## 系统架构
@@ -231,6 +232,9 @@ uv run scholarrag evaluate evals/your-dataset.jsonl
 | `SCHOLARRAG_EMBEDDING_DIMENSIONS` | `1024` |
 | `SCHOLARRAG_RERANK_MODEL` | `Qwen/Qwen3-VL-Reranker-8B` |
 | `SCHOLARRAG_CHAT_MODEL` | `Qwen/Qwen3.6-27B` |
+| `SCHOLARRAG_CHAT_INCLUDE_VISUAL_EVIDENCE` | `true`；回答阶段携带图/表图片给 VLM（成本开关） |
+| `SCHOLARRAG_CHAT_VISUAL_MAX_EDGE` | `1024`；图片最长边缩放上限（128–4096） |
+| `SCHOLARRAG_INGEST_VISUAL_BACKFILL` | `true`；图/表块缺图时按 bbox 从 PDF 渲染裁剪 |
 | `SCHOLARRAG_RAGAS_JUDGE_MODEL` | `Qwen/Qwen3.6-27B` |
 | `SCHOLARRAG_PHOENIX_ENDPOINT` | OTLP HTTP endpoint；留空可禁用 |
 | `SCHOLARRAG_API_BEARER_TOKEN` | 可选的 API Bearer 鉴权 |
@@ -250,6 +254,7 @@ data/
 │       ├── canonical/document.json
 │       ├── chunks/chunks.json
 │       ├── quality/report.json
+│       ├── visual/{block_id}.png   # bbox 渲染兜底的图/表证据
 │       └── pages/page-0001@2x.png
 ├── query_runs/{run_id}/
 │   ├── run.json
@@ -351,6 +356,7 @@ docker compose build
 - 当前定位是个人单用户、单摄取 worker；
 - Parser Gold、QA reviewed set 和 Judge-human correlation 仍需真实人员完成；
 - PP-StructureV3 目前只用于对照，不在生产主链；
+- 视觉证据的消融评测（文本 vs 文本+图）需要积累真实 query runs 后产出结论；
 - 后续可扩展 PostgreSQL、对象存储、多用户 RBAC、任务队列和持续回归门禁。
 
 ## 常见问题

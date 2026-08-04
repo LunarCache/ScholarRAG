@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import hashlib
 
-from scholarrag.domain.models import BlockKind, CanonicalDocument, Chunk, ContentBlock
+from scholarrag.domain.models import (
+    BlockKind,
+    CanonicalDocument,
+    Chunk,
+    ContentBlock,
+    VisualEvidence,
+)
 
 INDEXABLE_KINDS = {
     BlockKind.TITLE,
@@ -122,6 +128,19 @@ class SemanticChunker:
         identity = f"{document.parse_id}:{index}:{','.join(block.id for block in blocks)}"
         chunk_id = f"chk_{hashlib.sha256(identity.encode()).hexdigest()[:20]}"
         pages = sorted({block.source.page_number for block in blocks})
+        visual_evidence = [
+            VisualEvidence(
+                kind=block.kind,
+                image_path=block.image_path,
+                page_number=block.source.page_number,
+                bbox=block.source.bbox,
+                caption=(
+                    block.text or block.markdown or str(block.metadata.get("caption_text") or "")
+                )[:500],
+            )
+            for block in blocks
+            if block.kind in {BlockKind.FIGURE, BlockKind.TABLE} and block.image_path
+        ]
         return Chunk(
             id=chunk_id,
             document_id=document.document_id,
@@ -136,4 +155,5 @@ class SemanticChunker:
             level=level,
             parent_chunk_id=parent_chunk_id,
             metadata={"chunk_index": index, "title": document.title, **(metadata or {})},
+            visual_evidence=visual_evidence,
         )

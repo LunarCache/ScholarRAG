@@ -84,6 +84,20 @@ class CanonicalDocument(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class VisualEvidence(BaseModel):
+    """A visual asset attached to a chunk, read directly by the vision LLM.
+
+    OCR text describes and locates the content; the image carries the
+    information OCR may have lost (formulas, tables, figures).
+    """
+
+    kind: BlockKind
+    image_path: str
+    page_number: int = Field(ge=1)
+    bbox: BoundingBox | None = None
+    caption: str = ""
+
+
 class Chunk(BaseModel):
     id: str
     document_id: str
@@ -98,6 +112,7 @@ class Chunk(BaseModel):
     level: Literal["atomic", "parent", "child"] = "atomic"
     parent_chunk_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    visual_evidence: list[VisualEvidence] = Field(default_factory=list)
 
 
 class Citation(BaseModel):
