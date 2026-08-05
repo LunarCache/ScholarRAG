@@ -169,7 +169,7 @@ def test_normalize_chunk_and_catalog(tmp_path: Path) -> None:
     assert document.blocks[-1].source.raw_json_pointer == "/1/0"
     assert chunks and chunks[0].sources[0].bbox is not None
 
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     source = tmp_path / "paper.pdf"
     source.touch()
     Catalog(settings).register(
@@ -196,7 +196,7 @@ def test_dashboard_p95_never_falls_below_median_for_small_samples() -> None:
 
 
 def test_embedded_qdrant_uses_one_process_client_for_parallel_indexes(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     indexes = [VectorIndex(settings), VisualIndex(settings)] * 4
     with ThreadPoolExecutor(max_workers=8) as pool:
         clients = list(pool.map(lambda index: index._client(), indexes))
@@ -282,7 +282,7 @@ def test_hierarchical_chunks_index_only_retrievable_children(tmp_path: Path) -> 
     assert children
     assert {chunk.parent_chunk_id for chunk in children} == {parents[0].id}
 
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     source = tmp_path / "quality.pdf"
     source.touch()
     catalog = Catalog(settings)
@@ -323,6 +323,74 @@ def test_claims_link_to_minimal_evidence_spans() -> None:
     assert claims[0].evidence_spans[0].block_id == "block_1"
 
 
+def test_citation_skips_heading_blocks(tmp_path: Path) -> None:
+    """Citations anchor on the first content block, not the section heading."""
+    settings = Settings(data_dir=tmp_path / "data")
+    catalog = Catalog(settings)
+    parse_dir = tmp_path / "artifacts" / "parse_1"
+    canonical_dir = parse_dir / "canonical"
+    canonical_dir.mkdir(parents=True)
+    (canonical_dir / "document.json").write_text(
+        json.dumps(
+            {
+                "blocks": [
+                    {"id": "blk_heading", "kind": "heading", "text": "3 KNOWLEDGE-INTENSIVE REASONING TASKS"},
+                    {"id": "blk_body", "kind": "paragraph", "text": "As shown in Figure 1(1d), by interacting…"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    document = make_high_quality_document(parse_id="parse_1")
+    chunks = SemanticChunker(max_chars=10_000).chunk(document)
+    catalog.register(
+        document,
+        chunks,
+        source_path=tmp_path / "paper.pdf",
+        artifact_dir=parse_dir,
+    )
+
+    heading_source = SourcePointer(
+        document_id="doc_quality",
+        parse_id="parse_1",
+        provider="test",
+        page_number=4,
+        bbox=BoundingBox(x0=171, y0=369, x1=584, y1=385, coordinate_space="normalized_0_1000"),
+        raw_artifact="raw.json",
+    )
+    body_source = SourcePointer(
+        document_id="doc_quality",
+        parse_id="parse_1",
+        provider="test",
+        page_number=4,
+        bbox=BoundingBox(x0=169, y0=401, x1=826, y1=459, coordinate_space="normalized_0_1000"),
+        raw_artifact="raw.json",
+    )
+    chunk = Chunk(
+        id="chunk_1",
+        document_id="doc_quality",
+        parse_id="parse_1",
+        text="3 KNOWLEDGE-INTENSIVE REASONING TASKS\n\nAs shown in Figure 1(1d), by interacting…",
+        contextual_text="3 KNOWLEDGE-INTENSIVE REASONING TASKS\n\nAs shown in Figure 1(1d), by interacting…",
+        block_ids=["blk_heading", "blk_body"],
+        page_numbers=[4],
+        token_estimate=20,
+        sources=[heading_source, body_source],
+    )
+    item = RetrievedChunk(chunk=chunk, score=0.9)
+
+    # With catalog: skip the heading, land on the content block (same anchor
+    # the claim spans use).
+    citation = RAGService._citation(item, 5, catalog=catalog)
+    assert citation.bbox == body_source.bbox
+    assert citation.page_number == 4
+    assert citation.block_ids == ["blk_heading", "blk_body"]
+
+    # Without catalog: fall back to the chunk's first source (heading).
+    fallback = RAGService._citation(item, 5)
+    assert fallback.bbox == heading_source.bbox
+
+
 def test_citation_validity_compares_normalized_citation_ids() -> None:
     answer = Answer(
         answer="A grounded fact [C1].",
@@ -347,7 +415,7 @@ def test_citation_validity_compares_normalized_citation_ids() -> None:
 
 
 async def test_query_run_persists_ordered_pipeline_events(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = QueryRunStore(settings)
     run = await store.create(question="What is the contribution?", document_ids=["doc_1"], top_k=8)
     await store.update(run.run_id, status="running", started_at=utc_now())
@@ -380,7 +448,7 @@ async def test_query_run_persists_ordered_pipeline_events(tmp_path: Path) -> Non
 
 
 async def test_query_run_recovers_interrupted_snapshot(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = QueryRunStore(settings)
     run = await store.create(question="Interrupted query", document_ids=None, top_k=8)
     await store.update(run.run_id, status="running", started_at=utc_now())
@@ -395,7 +463,7 @@ async def test_query_run_recovers_interrupted_snapshot(tmp_path: Path) -> None:
 
 
 async def test_query_run_recovers_interrupted_evaluation_child_stage(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = QueryRunStore(settings)
     run = await store.create(question="Completed query", document_ids=None, top_k=8)
     await store.update(run.run_id, status="completed", completed_at=utc_now())
@@ -417,7 +485,7 @@ async def test_query_run_recovers_interrupted_evaluation_child_stage(tmp_path: P
 
 
 async def test_evaluation_jobs_are_async_deduplicated_and_recoverable(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     query_runs = QueryRunStore(settings)
     query_run = await query_runs.create(question="What is ReAct?", document_ids=None, top_k=8)
     await query_runs.update(query_run.run_id, status="completed", completed_at=utc_now())
@@ -483,7 +551,7 @@ async def test_evaluation_jobs_are_async_deduplicated_and_recoverable(tmp_path: 
 
 
 def test_ingestion_queue_is_idempotent_recoverable_and_dead_letters(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = IngestionJobStore(settings)
     source = tmp_path / "paper.pdf"
     source.touch()
@@ -516,7 +584,12 @@ def test_ingestion_queue_is_idempotent_recoverable_and_dead_letters(tmp_path: Pa
 async def test_query_run_completes_without_provider_calls_when_scope_is_empty(
     tmp_path: Path,
 ) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    # Pin the controlled workflow: with tool calling enabled the request is
+    # routed to the tool loop, which intentionally owns the empty-scope path.
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        agent_tool_calling=False,
+    )
     runtime = Runtime(settings)
     run = await runtime.query_runs.create(
         question="What evidence is available?",
@@ -582,6 +655,10 @@ async def test_siliconflow_stream_collects_deltas_usage_and_trace(tmp_path: Path
         assert payload["stream"] is True
         assert payload["model"] == "Qwen/Qwen3.6-27B"
         assert payload["enable_thinking"] is True
+        # Qwen3 official thinking-mode sampling defaults (never temperature=0).
+        assert payload["temperature"] == 0.6
+        assert payload["top_p"] == 0.95
+        assert payload["top_k"] == 20
         body = (
             'data: {"choices":[{"delta":{"content":"hello "}}]}\n\n'
             'data: {"choices":[{"delta":{"content":"world"}}],'
@@ -597,7 +674,6 @@ async def test_siliconflow_stream_collects_deltas_usage_and_trace(tmp_path: Path
     settings = Settings(
         data_dir=tmp_path / "data",
         siliconflow_api_key="test-key",
-        phoenix_endpoint=None,
     )
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = SiliconFlowClient(settings, client=http_client)
@@ -634,7 +710,6 @@ async def test_siliconflow_embeddings_use_content_cache(tmp_path: Path) -> None:
         data_dir=tmp_path / "data",
         siliconflow_api_key="test-key",
         provider_max_retries=0,
-        phoenix_endpoint=None,
     )
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = SiliconFlowClient(settings, client=http_client)
@@ -675,7 +750,6 @@ async def test_siliconflow_vl_rerank_accepts_mixed_text_and_image_documents(
         data_dir=tmp_path / "data",
         siliconflow_api_key="test-key",
         provider_max_retries=0,
-        phoenix_endpoint=None,
     )
     http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = SiliconFlowClient(settings, client=http_client)
@@ -703,7 +777,7 @@ async def test_siliconflow_vl_rerank_accepts_mixed_text_and_image_documents(
 
 
 def test_vl_rerank_builder_adds_traceable_image_input(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     artifact_dir = settings.artifacts_dir / "doc_quality" / "parses" / "parse_quality"
     image_path = artifact_dir / "raw" / "figure.png"
     image_path.parent.mkdir(parents=True)
@@ -750,17 +824,24 @@ def test_chat_and_ragas_judge_share_model_thinking_and_no_output_limit() -> None
     assert settings.ragas_judge_model == "Qwen/Qwen3.6-27B"
     assert settings.ragas_judge_context_window_tokens == 262_144
     assert settings.ragas_judge_enable_thinking is True
+    # Qwen3 official thinking-mode defaults: temperature=0.6, top_p=0.95,
+    # top_k=20, min_p=0. Greedy decoding (temperature=0) is forbidden.
+    assert settings.chat_temperature == 0.6
+    assert settings.chat_top_p == 0.95
+    assert settings.chat_top_k == 20
+    assert settings.chat_min_p == 0.0
+    assert settings.ragas_judge_temperature == 0.6
 
     llm = SimpleNamespace(
         model_args={
-            "temperature": 0,
+            "temperature": 0.6,
             "max_tokens": 1024,
             "max_completion_tokens": 2048,
             "max_output_tokens": 4096,
         }
     )
     RagasEvaluator._remove_judge_output_limits(llm)
-    assert llm.model_args == {"temperature": 0}
+    assert llm.model_args == {"temperature": 0.6}
 
 
 def test_parse_quality_gate_accepts_review_and_fallback_routes() -> None:
@@ -823,7 +904,7 @@ def test_parse_router_runs_fallback_compares_and_requires_review_on_disagreement
 
 
 def test_catalog_search_and_chunk_lookup_only_use_active_parse(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     catalog = Catalog(settings)
     source = tmp_path / "paper.pdf"
     source.touch()
@@ -852,7 +933,7 @@ def test_catalog_search_and_chunk_lookup_only_use_active_parse(tmp_path: Path) -
 
 
 def test_vector_search_filters_parse_id(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     old_chunk = SemanticChunker(max_chars=10_000).chunk(
         make_high_quality_document(parse_id="parse_old", phrase="old vector")
     )[0]
@@ -871,7 +952,6 @@ async def test_routed_ingestion_selects_fallback_before_activation(
 ) -> None:
     settings = Settings(
         data_dir=tmp_path / "data",
-        phoenix_endpoint=None,
         parse_fallback_mode="on_review",
     )
     service = IngestionService(settings)
@@ -928,7 +1008,7 @@ async def test_routed_ingestion_selects_fallback_before_activation(
 async def test_manual_review_reactivates_registered_parse_without_reindexing(
     tmp_path: Path,
 ) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = ArtifactStore(settings)
     catalog = Catalog(settings)
     source = store.document_dir("doc_quality") / "source" / "paper.pdf"
@@ -987,7 +1067,7 @@ async def test_manual_review_reactivates_registered_parse_without_reindexing(
 
 
 async def test_manual_review_requires_force_for_failed_quality_gate(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = ArtifactStore(settings)
     document = make_high_quality_document(parse_id="parse_rejected")
     parse_dir = store.parse_dir(document.document_id, document.parse_id)
@@ -1031,7 +1111,7 @@ async def test_manual_review_requires_force_for_failed_quality_gate(tmp_path: Pa
 async def test_activation_failure_is_audited_and_retryable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = ArtifactStore(settings)
     document = make_high_quality_document(parse_id="parse_retryable")
     parse_dir = store.parse_dir(document.document_id, document.parse_id)
@@ -1241,7 +1321,7 @@ def test_parser_gold_preparer_renders_and_does_not_overwrite_annotation(
         page = pdf.new_page()
         page.insert_text((72, 72), "Gold page")
         pdf.save(source)
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     source_hash = ParserGoldPreparer(settings).store.sha256(source)
     eval_dir = tmp_path / "evals"
     eval_dir.mkdir()
@@ -1340,7 +1420,7 @@ def test_human_review_workbench_enforces_independence_and_computes_gates(
 ) -> None:
     data_dir = tmp_path / "data"
     evals_dir = tmp_path / "evals"
-    settings = Settings(data_dir=data_dir, evals_dir=evals_dir, phoenix_endpoint=None)
+    settings = Settings(data_dir=data_dir, evals_dir=evals_dir)
     parser_root = evals_dir / "parser-gold"
     annotations = parser_root / "annotations"
     annotations.mkdir(parents=True)
@@ -1495,7 +1575,6 @@ def test_backup_includes_data_and_human_eval_artifacts(tmp_path: Path) -> None:
     settings = Settings(
         data_dir=tmp_path / "data",
         evals_dir=tmp_path / "evals",
-        phoenix_endpoint=None,
     )
     (settings.data_dir / "nested").mkdir(parents=True)
     (settings.evals_dir / "parser-gold/annotations").mkdir(parents=True)

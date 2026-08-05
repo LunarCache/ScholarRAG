@@ -142,7 +142,7 @@ def test_merge_empty_returns_defaults() -> None:
 def _register_document(tmp_path: Path, report: ParseQualityReport) -> str:
     from scholarrag.domain.models import CanonicalDocument
 
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     catalog = Catalog(settings)
     artifact_dir = tmp_path / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +171,7 @@ def _register_document(tmp_path: Path, report: ParseQualityReport) -> str:
 
 
 def test_load_quality_reports_reads_persisted_reports(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     document_id = _register_document(tmp_path, make_report(failed={"text_density"}))
 
     reports = load_quality_reports(Catalog(settings), {document_id})
@@ -182,7 +182,7 @@ def test_load_quality_reports_reads_persisted_reports(tmp_path: Path) -> None:
 
 
 def test_load_quality_reports_skips_missing_or_corrupt(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     document_id = _register_document(tmp_path, make_report())
     artifact_dir = tmp_path / "artifacts"
     (artifact_dir / "quality" / "report.json").write_text("{not json", encoding="utf-8")
@@ -267,7 +267,6 @@ async def test_rag_service_forces_images_when_report_says_text_unreliable(
     ]
     cfg = Settings(
         data_dir=tmp_path / "data",
-        phoenix_endpoint=None,
         siliconflow_api_key="test-key",
         chat_include_visual_evidence=False,
     )
@@ -300,7 +299,6 @@ async def test_rag_service_stays_text_only_without_reports(
     ]
     cfg = Settings(
         data_dir=tmp_path / "data",
-        phoenix_endpoint=None,
         siliconflow_api_key="test-key",
         chat_include_visual_evidence=False,
     )

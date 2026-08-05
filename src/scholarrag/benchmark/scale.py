@@ -25,7 +25,7 @@ class ScaleBenchmarkRunner:
 
     def run(self, output: Path) -> dict[str, Any]:
         root = Path(tempfile.mkdtemp(prefix="scholarrag-scale-"))
-        settings = Settings(data_dir=root, phoenix_endpoint=None)
+        settings = Settings(data_dir=root)
         Catalog(settings)
         setup_started = time.perf_counter()
         self._populate_sqlite(settings.sqlite_path)

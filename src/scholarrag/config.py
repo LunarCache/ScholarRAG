@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     rerank_model: str = "Qwen/Qwen3-VL-Reranker-8B"
     chat_model: str = "Qwen/Qwen3.6-27B"
     chat_enable_thinking: bool = True
+    # Qwen3 official recommendations for thinking mode: temperature=0.6,
+    # top_p=0.95, top_k=20, min_p=0. Greedy decoding (temperature=0) must be
+    # avoided — it degrades performance and causes repetitive output.
+    chat_temperature: float = Field(default=0.6, ge=0.01, le=2.0)
+    chat_top_p: float = Field(default=0.95, ge=0.01, le=1.0)
+    chat_top_k: int = Field(default=20, ge=1, le=100)
+    chat_min_p: float = Field(default=0.0, ge=0.0, le=1.0)
+    # Optional cap on per-turn thinking tokens (Qwen docs recommend >1024).
+    chat_thinking_budget: int | None = Field(default=None, ge=1024, le=65536)
     chat_input_cny_per_million_tokens: float = Field(default=0, ge=0)
     chat_output_cny_per_million_tokens: float = Field(default=0, ge=0)
     provider_max_concurrency: int = Field(default=8, ge=1, le=64)
@@ -68,6 +77,11 @@ class Settings(BaseSettings):
     agent_max_steps: int = Field(default=4, ge=1, le=8)
     agent_timeout_seconds: float = Field(default=180, ge=10, le=900)
     agent_max_context_chars: int = Field(default=48_000, ge=4_000, le=200_000)
+    # Tool-calling agentic RAG: the planner turns retrieval primitives into
+    # OpenAI-compatible tools and lets the chat model decide the search order.
+    # Falls back to the hard-coded multi-step planner when disabled.
+    agent_tool_calling: bool = True
+    agent_tool_max_calls: int = Field(default=12, ge=1, le=40)
     # Visual evidence: attach block images (figures/tables) to generation messages
     # so the vision LLM reads them directly instead of relying on lossy OCR text.
     # No per-request image-count budget: every distinct figure/table image among
@@ -77,9 +91,7 @@ class Settings(BaseSettings):
     ragas_judge_model: str = "Qwen/Qwen3.6-27B"
     ragas_judge_context_window_tokens: int = 262_144
     ragas_judge_enable_thinking: bool = True
-
-    phoenix_endpoint: str | None = None
-    otel_service_name: str = "scholarrag-api"
+    ragas_judge_temperature: float = Field(default=0.6, ge=0.01, le=2.0)
 
     @property
     def artifacts_dir(self) -> Path:

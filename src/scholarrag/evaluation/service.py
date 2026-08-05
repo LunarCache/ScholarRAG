@@ -157,7 +157,7 @@ class RagasEvaluator:
             llm_factory(
                 self.settings.ragas_judge_model,
                 client=client,
-                temperature=0,
+                temperature=self.settings.ragas_judge_temperature,
                 extra_body={
                     "enable_thinking": self.settings.ragas_judge_enable_thinking,
                 },

@@ -52,6 +52,7 @@ class QueryRun(BaseModel):
     document_ids: list[str] | None = None
     top_k: int = 8
     agentic: bool = True
+    tool_mode: bool | None = None
     conversation_id: str | None = None
     parent_run_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -262,6 +263,7 @@ class QueryRunStore:
         document_ids: list[str] | None,
         top_k: int,
         agentic: bool = True,
+        tool_mode: bool | None = None,
         conversation_id: str | None = None,
         parent_run_id: str | None = None,
     ) -> QueryRun:
@@ -275,6 +277,7 @@ class QueryRunStore:
             document_ids=document_ids,
             top_k=top_k,
             agentic=agentic,
+            tool_mode=tool_mode,
             conversation_id=conversation_id,
             parent_run_id=parent_run_id,
             artifact_dir=str(run_dir),
@@ -291,6 +294,7 @@ class QueryRunStore:
                 "document_ids": document_ids or [],
                 "top_k": top_k,
                 "agentic": agentic,
+                "tool_mode": tool_mode,
                 "conversation_id": conversation_id,
                 "parent_run_id": parent_run_id,
             },

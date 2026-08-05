@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 import uuid
+from pathlib import Path
 
 from scholarrag.config import Settings
 from scholarrag.domain.models import (
@@ -12,7 +14,6 @@ from scholarrag.domain.models import (
     EvidenceSpan,
     RetrievedChunk,
 )
-from scholarrag.observability import current_trace_id, get_tracer
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer
 from scholarrag.rag.visual_routing import (
@@ -23,6 +24,34 @@ from scholarrag.rag.visual_routing import (
 from scholarrag.rag.visuals import build_multimodal_content, default_prompt
 from scholarrag.retrieval.service import RetrievalService
 from scholarrag.storage.catalog import Catalog
+
+# Blocks that act as structural anchors rather than evidence content. Citation
+# hover/click should skip these and land on the first real content block.
+_ANCHOR_KINDS = {"title", "heading", "header", "footer", "page_number"}
+_CANONICAL_BLOCK_KINDS: dict[str, dict[str, str]] = {}
+
+
+def _block_kinds_by_parse(catalog: Catalog, parse_id: str) -> dict[str, str]:
+    """Map ``block_id -> kind`` from the canonical document, cached per parse."""
+    cached = _CANONICAL_BLOCK_KINDS.get(parse_id)
+    if cached is not None:
+        return cached
+    kinds: dict[str, str] = {}
+    record = catalog.get_parse(parse_id)
+    if record is not None:
+        canonical = Path(str(record["artifact_dir"])) / "canonical" / "document.json"
+        if canonical.is_file():
+            try:
+                payload = json.loads(canonical.read_text(encoding="utf-8"))
+                kinds = {
+                    str(block["id"]): str(block.get("kind") or "")
+                    for block in payload.get("blocks", [])
+                    if block.get("id")
+                }
+            except (OSError, ValueError):
+                kinds = {}
+    _CANONICAL_BLOCK_KINDS[parse_id] = kinds
+    return kinds
 
 SYSTEM_PROMPT = """你是严谨的论文阅读助手。只能根据给出的证据回答。
 要求：
@@ -40,6 +69,7 @@ class RAGService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.retrieval = RetrievalService(settings)
+        self.catalog = Catalog(settings)
 
     async def answer(
         self,
@@ -50,20 +80,14 @@ class RAGService:
         events: EventSink | None = None,
         trace_id: str | None = None,
     ) -> Answer:
-        tracer = get_tracer()
-        with tracer.start_as_current_span("rag.answer") as span:
-            span.set_attribute("rag.question_length", len(question))
-            span.set_attribute("rag.top_k", top_k)
-            span.set_attribute("rag.document_scope_count", len(document_ids or []))
-            answer = await self._answer(
-                question,
-                document_ids=document_ids,
-                top_k=top_k,
-                events=events,
-                trace_id=trace_id,
-            )
-            span.set_attribute("rag.citation_count", len(answer.citations))
-            return answer
+        answer = await self._answer(
+            question,
+            document_ids=document_ids,
+            top_k=top_k,
+            events=events,
+            trace_id=trace_id,
+        )
+        return answer
 
     async def _answer(
         self,
@@ -74,7 +98,7 @@ class RAGService:
         events: EventSink | None,
         trace_id: str | None,
     ) -> Answer:
-        answer_trace_id = trace_id or current_trace_id() or uuid.uuid4().hex
+        answer_trace_id = trace_id or uuid.uuid4().hex
         pipeline = PipelineTracer(events)
         retrieved, debug = await self.retrieval.retrieve(
             question,
@@ -132,63 +156,40 @@ class RAGService:
                 model=self.settings.chat_model,
                 input={"context_count": len(retrieved), "context_chars": len(contexts)},
             ) as stage:
-                with get_tracer().start_as_current_span("rag.generate") as span:
-                    span.set_attribute("gen_ai.request.model", self.settings.chat_model)
-                    span.set_attribute("rag.context_count", len(retrieved))
-                    reports = load_quality_reports(
-                        Catalog(self.settings),
-                        {item.chunk.document_id for item in retrieved},
-                    )
-                    routing = merge_routing_decisions(
-                        [visual_routing_policy(report) for report in reports]
-                    )
-                    span.set_attribute("rag.visual_force", routing.force_visual)
-                    if routing.force_visual:
-                        span.set_attribute(
-                            "rag.visual_routing_reasons", "; ".join(routing.reasons)
-                        )
-                    visual = build_multimodal_content(
-                        default_prompt(question, contexts),
-                        retrieved,
-                        self.settings,
-                        force=routing.force_visual,
-                    )
-                    messages = [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": visual.parts},
-                    ]
-                    generation_usage: dict[str, object] = {}
-                    if events:
-                        answer_parts: list[str] = []
-                        pending_delta = ""
-                        last_emit = time.perf_counter()
-                        async with provider.chat_stream(messages) as stream:
-                            async for chunk in stream.chunks():
-                                choices = chunk.get("choices") or []
-                                content = (
-                                    choices[0].get("delta", {}).get("content") if choices else None
-                                )
-                                if not content:
-                                    continue
-                                answer_parts.append(str(content))
-                                pending_delta += str(content)
-                                now = time.perf_counter()
-                                if len(pending_delta) >= 80 or now - last_emit >= 0.12:
-                                    await events.emit(
-                                        event_type="generation.delta",
-                                        stage_id="generation.answer",
-                                        label="大模型生成回答",
-                                        status="running",
-                                        component="siliconflow",
-                                        model=self.settings.chat_model,
-                                        output={
-                                            "text_delta": pending_delta,
-                                            "answer_chars": sum(map(len, answer_parts)),
-                                        },
-                                    )
-                                    pending_delta = ""
-                                    last_emit = now
-                            if pending_delta:
+                reports = load_quality_reports(
+                    Catalog(self.settings),
+                    {item.chunk.document_id for item in retrieved},
+                )
+                routing = merge_routing_decisions(
+                    [visual_routing_policy(report) for report in reports]
+                )
+                visual = build_multimodal_content(
+                    default_prompt(question, contexts),
+                    retrieved,
+                    self.settings,
+                    force=routing.force_visual,
+                )
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": visual.parts},
+                ]
+                generation_usage: dict[str, object] = {}
+                if events:
+                    answer_parts: list[str] = []
+                    pending_delta = ""
+                    last_emit = time.perf_counter()
+                    async with provider.chat_stream(messages) as stream:
+                        async for chunk in stream.chunks():
+                            choices = chunk.get("choices") or []
+                            content = (
+                                choices[0].get("delta", {}).get("content") if choices else None
+                            )
+                            if not content:
+                                continue
+                            answer_parts.append(str(content))
+                            pending_delta += str(content)
+                            now = time.perf_counter()
+                            if len(pending_delta) >= 80 or now - last_emit >= 0.12:
                                 await events.emit(
                                     event_type="generation.delta",
                                     stage_id="generation.answer",
@@ -201,16 +202,29 @@ class RAGService:
                                         "answer_chars": sum(map(len, answer_parts)),
                                     },
                                 )
-                            generation_trace_id = stream.trace_id
-                            generation_usage = stream.usage
-                        answer_text = "".join(answer_parts)
-                    else:
-                        response = await provider.chat(messages)
-                        answer_text = response.data["choices"][0]["message"]["content"]
-                        generation_trace_id = response.trace_id
-                        generation_usage = response.data.get("usage") or {}
-                    if generation_trace_id:
-                        span.set_attribute("provider.siliconflow_trace_id", generation_trace_id)
+                                pending_delta = ""
+                                last_emit = now
+                        if pending_delta:
+                            await events.emit(
+                                event_type="generation.delta",
+                                stage_id="generation.answer",
+                                label="大模型生成回答",
+                                status="running",
+                                component="siliconflow",
+                                model=self.settings.chat_model,
+                                output={
+                                    "text_delta": pending_delta,
+                                    "answer_chars": sum(map(len, answer_parts)),
+                                },
+                            )
+                        generation_trace_id = stream.trace_id
+                        generation_usage = stream.usage
+                    answer_text = "".join(answer_parts)
+                else:
+                    response = await provider.chat(messages)
+                    answer_text = response.data["choices"][0]["message"]["content"]
+                    generation_trace_id = response.trace_id
+                    generation_usage = response.data.get("usage") or {}
                 estimated_cost = self._generation_cost(generation_usage)
                 stage.complete(
                     output={
@@ -241,7 +255,10 @@ class RAGService:
             invalid_indexes = sorted(
                 {index for index in referenced_indexes if not 1 <= index <= len(retrieved)}
             )
-            citations = [self._citation(retrieved[index - 1], index) for index in cited_indexes]
+            citations = [
+                self._citation(retrieved[index - 1], index, catalog=self.catalog)
+                for index in cited_indexes
+            ]
             claims = self._claims(answer_text, retrieved)
             stage.complete(
                 output={
@@ -297,8 +314,28 @@ class RAGService:
         return f"[C{index}] 论文：{title}；页码：{pages}\n{item.chunk.text}{parent}"
 
     @staticmethod
-    def _citation(item: RetrievedChunk, index: int) -> Citation:
+    def _citation(
+        item: RetrievedChunk,
+        index: int,
+        *,
+        catalog: Catalog | None = None,
+    ) -> Citation:
+        """Build a citation anchored on the chunk's first *content* block.
+
+        Chunks often start with a section heading (the semantic chunker keeps
+        the heading with its body), so ``sources[0]`` would point at the
+        heading — clicking the citation then jumps to the title instead of
+        the actual evidence. With a catalog, structural anchors (title,
+        heading, header, footer, page numbers) are skipped so the citation
+        lands on the same content the claim spans point at.
+        """
         source = item.chunk.sources[0]
+        if catalog is not None and len(item.chunk.sources) == len(item.chunk.block_ids):
+            kinds = _block_kinds_by_parse(catalog, item.chunk.parse_id)
+            for position, block_id in enumerate(item.chunk.block_ids):
+                if kinds.get(block_id) not in _ANCHOR_KINDS:
+                    source = item.chunk.sources[position]
+                    break
         return Citation(
             citation_id=f"C{index}",
             document_id=item.chunk.document_id,
@@ -317,11 +354,38 @@ class RAGService:
             r".+?(?:(?<!\d)[。！？!?]|(?<!\d)\.(?!\d)|\n|$)",
             re.MULTILINE,
         )
-        for match in pattern.finditer(answer):
-            raw = match.group().strip()
+        fragments = [
+            (match.start(), match.end(), match.group().strip())
+            for match in pattern.finditer(answer)
+        ]
+        position = 0
+        while position < len(fragments):
+            start, end, raw = fragments[position]
+            position += 1
             text = re.sub(r"\s*\[C\d+\]", "", raw).strip()
             if len(text) < 6:
                 continue
+            # Merge heading-like fragments (list titles, bold labels, trailing
+            # colons) that carry no citation with the following sentences so
+            # Markdown structure does not surface as unsupported pseudo-claims.
+            # Once a merge starts, keep absorbing wrapped heading lines until
+            # a citation shows up or the budget is exhausted.
+            fragment_like = re.search(
+                r"(?:^\s*(?:[-*#+\d]+[.)、]|\*{1,2}\S))|[:：]\s*$|\*{1,2}\s*$", text
+            )
+            merged = 0
+            while (
+                merged < 6
+                and len(text) < 400
+                and not re.findall(r"\[C\d+\]", raw)
+                and (merged > 0 or fragment_like)
+                and position < len(fragments)
+            ):
+                _, end, next_raw = fragments[position]
+                raw = f"{raw} {next_raw}"
+                text = re.sub(r"\s*\[C\d+\]", "", raw).strip()
+                position += 1
+                merged += 1
             indexes = sorted(
                 {
                     int(value)
@@ -334,8 +398,8 @@ class RAGService:
                 ClaimCitation(
                     claim_id=f"CL{len(claims) + 1}",
                     text=text,
-                    answer_start_char=match.start(),
-                    answer_end_char=match.end(),
+                    answer_start_char=start,
+                    answer_end_char=end,
                     citation_ids=[f"C{index}" for index in indexes],
                     evidence_spans=spans,
                     supported=bool(spans),

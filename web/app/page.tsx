@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { EvidencePointer, QueryRun, RunFlow, TraceEvent } from "./RunFlow";
+import { AgentTraceCompact, EvidencePointer, QueryRun, RunFlow, TraceEvent } from "./RunFlow";
 import { ReviewWorkbench } from "./ReviewWorkbench";
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
@@ -87,6 +87,13 @@ type QueryRunSnapshot = QueryRun & {
   answer: Answer | null;
 };
 
+type ChatTurn = {
+  run_id: string;
+  question: string;
+  answer: Answer | null;
+  status: QueryRun["status"];
+};
+
 type Evaluation = {
   run_id: string;
   metrics: Record<string, { value: number | string | boolean | null; reason?: string }>;
@@ -115,8 +122,10 @@ export default function Home() {
   const [page, setPage] = useState(1);
   const [highlight, setHighlight] = useState<Citation["bbox"]>(null);
   const [question, setQuestion] = useState("");
-  const [agentic, setAgentic] = useState(true);
+  // tool = 工具调用型 Agent（默认）；multi = 多步规划受控 Agent；rag = 单轮检索。
+  const [answerMode, setAnswerMode] = useState<"tool" | "multi" | "rag">("tool");
   const [conversationId, setConversationId] = useState(() => crypto.randomUUID());
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [lastQuestion, setLastQuestion] = useState("");
   const [answer, setAnswer] = useState<Answer | null>(null);
   const [streamedAnswer, setStreamedAnswer] = useState("");
@@ -144,8 +153,13 @@ export default function Home() {
   const [personal, setPersonal] = useState({ reading_status: "unread", tags: [] as string[], note: "", favorite: false });
   const [status, setStatus] = useState("准备就绪");
   const fileRef = useRef<HTMLInputElement>(null);
+  const conversationRef = useRef<HTMLDivElement>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const evaluationEventSourceRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    conversationRef.current?.scrollTo({ top: conversationRef.current.scrollHeight });
+  }, [turns, answer, streamedAnswer, queryRun?.status]);
 
   const refresh = useCallback(async () => {
     const response = await fetch(`${API}/api/documents`);
@@ -178,6 +192,30 @@ export default function Home() {
       })).catch(() => undefined);
   }, [activePaper]);
 
+  // Rehydrate the chat thread (question bubbles + answers) when a conversation
+  // is opened, started fresh, or when the current run finishes.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`${API}/api/query-runs?limit=100`);
+        if (!response.ok) return;
+        const runs: QueryRunSnapshot[] = await response.json();
+        const own = runs
+          .filter((run) => run.conversation_id === conversationId)
+          .sort((left, right) => left.created_at.localeCompare(right.created_at))
+          .map((run) => ({ run_id: run.run_id, question: run.question, answer: run.answer, status: run.status }));
+        const hasCurrent = own.some((turn) => turn.run_id === queryRun?.run_id);
+        const merged = queryRun && !hasCurrent
+          ? [...own, { run_id: queryRun.run_id, question: queryRun.question, answer: queryRun.answer ?? null, status: queryRun.status }]
+          : own;
+        if (!cancelled) setTurns(merged);
+      } catch { /* chat thread is best-effort; trace views stay authoritative */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [conversationId, queryRun?.run_id, queryRun?.status, answer]);
+
   const loadReview = useCallback(async (documentId: string) => {
     const [versionsResponse, routesResponse] = await Promise.all([
       fetch(`${API}/api/documents/${documentId}/parses`),
@@ -203,7 +241,7 @@ export default function Home() {
       const response = await fetch(`${API}/api/documents`, { method: "POST", body: form });
       if (!response.ok) throw new Error(await response.text());
       const { job_id } = await response.json();
-      for (;;) {
+      for (; ;) {
         await new Promise((resolve) => setTimeout(resolve, 1800));
         const jobResponse = await fetch(`${API}/api/jobs/${job_id}`);
         const job = await jobResponse.json();
@@ -250,7 +288,8 @@ export default function Home() {
         body: JSON.stringify({
           question: prompt,
           document_ids: selected.length ? selected : null,
-          agentic,
+          agentic: answerMode !== "rag",
+          tool_mode: answerMode === "tool",
           conversation_id: conversationId,
           parent_run_id: queryRun?.run_id ?? null,
         }),
@@ -258,6 +297,7 @@ export default function Home() {
       if (!response.ok) throw new Error(await response.text());
       const run: QueryRunSnapshot = await response.json();
       setQueryRun(run);
+      setQuestion(""); // 提交成功，清空输入框便于下一次提问
       setStatus("已建立执行轨迹，正在确定检索范围…");
       watchQueryRun(run.run_id);
     } catch (error) {
@@ -376,13 +416,11 @@ export default function Home() {
       setEvaluationEvents(events.filter((event) => event.stage_id.startsWith("evaluation.")));
       setEvaluationJob(restoredEvaluationJob);
       setEvaluation(restoredEvaluationJob?.result ?? null);
+      if (run.conversation_id) setConversationId(run.conversation_id);
       setAnswer(run.answer);
       setStreamedAnswer(run.answer ? "" : events
         .filter((event) => event.type === "generation.delta" && typeof event.output.text_delta === "string")
         .map((event) => String(event.output.text_delta)).join(""));
-      setLastQuestion(run.question);
-      setConversationId(run.conversation_id ?? crypto.randomUUID());
-      setQuestion(run.question);
       setHistoryOpen(false);
       setActiveView("runs");
       const running = ["queued", "running"].includes(run.status);
@@ -704,48 +742,69 @@ export default function Home() {
         </section>
 
         <section className="assistantPanel">
-          <div className="panelHead"><div><span className="eyebrow">Persistent Chat Dock</span><h2>论文助手</h2></div><div className="scopeActions"><button title="新建会话" onClick={() => { setConversationId(crypto.randomUUID()); setQueryRun(null); setAnswer(null); setRunEvents([]); setEvaluationEvents([]); setEvaluationJob(null); setEvaluation(null); setEvaluationBusy(false); evaluationEventSourceRef.current?.close(); setStatus("已新建会话"); }}>＋</button><button title="历史轨迹" onClick={() => void openRunHistory()}>↺</button><span className="scope">{selected.length || papers.length} 篇</span></div></div>
-          <div className="conversation">
-            {!answer && !busy && !queryRun && <div className="welcome"><span>⌁</span><h3>从证据出发，而不是凭印象回答</h3>
+          <div className="panelHead"><div><span className="eyebrow">Persistent Chat Dock</span><h2>论文助手</h2></div><div className="scopeActions"><button title="新建会话" onClick={() => { setConversationId(crypto.randomUUID()); setTurns([]); setQueryRun(null); setAnswer(null); setRunEvents([]); setEvaluationEvents([]); setEvaluationJob(null); setEvaluation(null); setEvaluationBusy(false); evaluationEventSourceRef.current?.close(); setStatus("已新建会话"); }}>＋</button><button title="历史轨迹" onClick={() => void openRunHistory()}>↺</button><span className="scope">{selected.length || papers.length} 篇</span></div></div>
+          <div className="conversation" ref={conversationRef}>
+            {!turns.length && !answer && !busy && !queryRun && <div className="welcome"><span>⌁</span><h3>从证据出发，而不是凭印象回答</h3>
               <p>询问方法、公式、实验对比或跨论文差异。每条引用都能回到原页。</p>
               <button onClick={() => setQuestion("这篇论文的核心贡献、方法和主要实验结论是什么？")}>生成精读提纲</button></div>}
+            {turns.map((turn) => {
+              const isCurrent = queryRun?.run_id === turn.run_id;
+              const live = isCurrent && ["queued", "running"].includes(queryRun!.status);
+              return <div className="chatTurn" key={turn.run_id}>
+                <div className="chatQuestion">{turn.question}</div>
+                {turn.status !== "completed" && !live && <span className={`turnState ${turn.status}`}>{turn.status}</span>}
+                {isCurrent && queryRun && <button className="chatRunPeek" onClick={() => setActiveView("runs")}><span className={`runState ${queryRun.status}`}>{queryRun.status}</span><div><b>运行轨迹</b><small>{runEvents.length + evaluationEvents.length} events · 点击在中央查看</small></div><span>→</span></button>}
+                {isCurrent && <AgentTraceCompact events={runEvents} running={live} />}
+                {isCurrent && !answer && !turn.answer && streamedAnswer && <div className="answerText streamingAnswer"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{streamedAnswer}</ReactMarkdown><span className="streamCursor" /></div>}
+                {(() => {
+                  const turnAnswer = isCurrent ? (answer ?? turn.answer) : turn.answer;
+                  if (!turnAnswer || live) return null;
+                  return <>
+                    <div className="answerText"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{turnAnswer.answer}</ReactMarkdown></div>
+                    <div className="citations"><div className="subhead">引用证据</div>
+                      {turnAnswer.citations.map((citation) => <button key={citation.citation_id} onClick={() => openCitation(citation)}>
+                        <b>{citation.citation_id}</b><span><strong>第 {citation.page_number} 页</strong>{plainQuote(citation.quote)}</span>
+                        <em>{citation.score == null ? "" : citation.score.toFixed(3)}</em></button>)}
+                    </div>
+                    {turnAnswer.claims?.length > 0 && <details className="claimEvidence"><summary>Claim → evidence span · {turnAnswer.claims.length}</summary>
+                      {turnAnswer.claims.map((claim) => <article key={claim.claim_id}><div><b>{claim.claim_id}</b><span className={claim.supported ? "supported" : "unsupported"}>{claim.supported ? "已定位" : "缺少证据"}</span></div><p>{claim.text}</p>
+                        {claim.evidence_spans.map((span) => <button key={`${claim.claim_id}-${span.citation_id}`} onClick={() => {
+                          const citation = turnAnswer.citations.find((item) => item.citation_id === span.citation_id);
+                          if (citation) openCitation({ ...citation, page_number: span.page_number, bbox: span.bbox });
+                        }}><b>{span.citation_id} · 第 {span.page_number} 页</b><span>{plainQuote(span.quote)}</span></button>)}</article>)}</details>}
+                    {isCurrent && <>
+                      <details className="trace"><summary>查看完整检索轨迹 <code>{turnAnswer.trace_id.slice(0, 12)}</code></summary>
+                        <pre>{JSON.stringify(turnAnswer.retrieval_debug, null, 2)}</pre></details>
+                      <div className="evaluationActions">
+                        <button className="evaluate" onClick={() => void runEvaluation()} disabled={busy || evaluationBusy}>{evaluationBusy ? "Ragas 评测运行中…" : evaluation ? "重新用 Ragas 复评" : "用 Ragas 复评本问题"}</button>
+                        {evaluationBusy && <button className="cancelEvaluation" onClick={() => void cancelEvaluation()}>取消评测</button>}
+                      </div>
+                      {evaluationJob && <div className={`evaluationJob evaluation-${evaluationJob.status}`}><span>{evaluationJob.status}</span><code>{evaluationJob.job_id.slice(0, 18)}</code>{evaluationJob.error && <small>{evaluationJob.error}</small>}</div>}
+                      {evaluation && <div className="metrics">{Object.entries(evaluation.metrics).map(([name, score]) =>
+                        <div key={name}><span>{name.replaceAll("_", " ")}</span><b>{typeof score.value === "number" ? score.value.toFixed(3) : String(score.value)}</b></div>)}</div>}
+                    </>}
+                    <a className="exportReport" href={`${API}/api/query-runs/${encodeURIComponent(turn.run_id)}/export`}>导出证据报告.md</a>
+                  </>;
+                })()}
+              </div>;
+            })}
             {busy && !queryRun && <div className="thinking"><i /><i /><i /><span>正在建立执行轨迹</span></div>}
-            {queryRun && <button className="chatRunPeek" onClick={() => setActiveView("runs")}><span className={`runState ${queryRun.status}`}>{queryRun.status}</span><div><b>运行轨迹</b><small>{runEvents.length + evaluationEvents.length} events · 点击在中央查看</small></div><span>→</span></button>}
-            {!answer && streamedAnswer && <div className="answerText streamingAnswer"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{streamedAnswer}</ReactMarkdown><span className="streamCursor" /></div>}
-            {answer && <>
-              <div className="answerText"><ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>{answer.answer}</ReactMarkdown></div>
-              <div className="citations"><div className="subhead">引用证据</div>
-                {answer.citations.map((citation) => <button key={citation.citation_id} onClick={() => openCitation(citation)}>
-                  <b>{citation.citation_id}</b><span><strong>第 {citation.page_number} 页</strong>{plainQuote(citation.quote)}</span>
-                  <em>{citation.score == null ? "" : citation.score.toFixed(3)}</em></button>)}
-              </div>
-              {answer.claims?.length > 0 && <details className="claimEvidence"><summary>Claim → evidence span · {answer.claims.length}</summary>
-                {answer.claims.map((claim) => <article key={claim.claim_id}><div><b>{claim.claim_id}</b><span className={claim.supported ? "supported" : "unsupported"}>{claim.supported ? "已定位" : "缺少证据"}</span></div><p>{claim.text}</p>
-                  {claim.evidence_spans.map((span) => <button key={`${claim.claim_id}-${span.citation_id}`} onClick={() => {
-                    const citation = answer.citations.find((item) => item.citation_id === span.citation_id);
-                    if (citation) openCitation({ ...citation, page_number: span.page_number, bbox: span.bbox });
-                  }}><b>{span.citation_id} · 第 {span.page_number} 页</b><span>{plainQuote(span.quote)}</span></button>)}</article>)}</details>}
-              <details className="trace"><summary>查看完整检索轨迹 <code>{answer.trace_id.slice(0, 12)}</code></summary>
-                <pre>{JSON.stringify(answer.retrieval_debug, null, 2)}</pre></details>
-              <div className="evaluationActions">
-                <button className="evaluate" onClick={() => void runEvaluation()} disabled={busy || evaluationBusy}>{evaluationBusy ? "Ragas 评测运行中…" : evaluation ? "重新用 Ragas 复评" : "用 Ragas 复评本问题"}</button>
-                {evaluationBusy && <button className="cancelEvaluation" onClick={() => void cancelEvaluation()}>取消评测</button>}
-              </div>
-              {evaluationJob && <div className={`evaluationJob evaluation-${evaluationJob.status}`}><span>{evaluationJob.status}</span><code>{evaluationJob.job_id.slice(0, 18)}</code>{evaluationJob.error && <small>{evaluationJob.error}</small>}</div>}
-              {queryRun?.run_id && <a className="exportReport" href={`${API}/api/query-runs/${encodeURIComponent(queryRun.run_id)}/export`}>导出证据报告.md</a>}
-              {evaluation && <div className="metrics">{Object.entries(evaluation.metrics).map(([name, score]) =>
-                <div key={name}><span>{name.replaceAll("_", " ")}</span><b>{typeof score.value === "number" ? score.value.toFixed(3) : String(score.value)}</b></div>)}</div>}
-            </>}
           </div>
           <form className="composer" onSubmit={ask}>
             <textarea value={question} onChange={(event) => setQuestion(event.target.value)} onKeyDown={(event) => {
+              // Ignore Enter while the IME is composing (e.g. 拼音选词),
+              // otherwise confirming a candidate submits the question.
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }
             }}
               placeholder="询问论文中的方法、公式、实验或局限…" rows={3} />
-            <div><label className="agentToggle"><input type="checkbox" checked={agentic} onChange={(event) => setAgentic(event.target.checked)} />Agentic 精读</label><span>Enter 提问 · Shift+Enter 换行</span><button type="submit" disabled={busy || !question.trim()}>发送</button></div>
+            <div><span className="modeSwitch" role="radiogroup" aria-label="回答模式">
+              {([["tool", "工具 Agent", "模型自主调用 list_papers / get_paper / retrieve / read_chunk"], ["multi", "多步规划", "受控 Planner 拆解子问题并迭代检索"], ["rag", "单轮检索", "一次混合检索直接生成，最快"]] as const).map(([value, label, tip]) =>
+                <button type="button" key={value} title={tip} role="radio" aria-checked={answerMode === value} className={answerMode === value ? "on" : ""} onClick={() => setAnswerMode(value)}>{label}</button>)}
+            </span><span>Enter 提问 · Shift+Enter 换行</span><button type="submit" disabled={busy || !question.trim()}>发送</button></div>
           </form>
         </section>
       </section>

@@ -129,7 +129,7 @@ def test_compare_ablation_empty_groups() -> None:
 
 
 def test_visual_metrics_reads_query_run_events(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
     store = QueryRunStore(settings)
     run = _create_run(store, question="表格数据是什么？")
     _append_generation_event(store, run.run_id, included=2, skipped=0)
@@ -141,7 +141,7 @@ def test_visual_metrics_reads_query_run_events(tmp_path: Path) -> None:
 
 
 def test_visual_metrics_missing_run_returns_empty(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    settings = Settings(data_dir=tmp_path / "data")
 
     assert RagasEvaluator(settings)._visual_metrics("no-such-run") == {}
     assert RagasEvaluator(settings)._visual_metrics(None) == {}
@@ -188,8 +188,8 @@ def _append_generation_event(
 
 def test_query_run_store_isolation(tmp_path: Path) -> None:
     """Sanity check: two stores in different data dirs do not collide."""
-    store_a = QueryRunStore(Settings(data_dir=tmp_path / "a", phoenix_endpoint=None))
-    store_b = QueryRunStore(Settings(data_dir=tmp_path / "b", phoenix_endpoint=None))
+    store_a = QueryRunStore(Settings(data_dir=tmp_path / "a"))
+    store_b = QueryRunStore(Settings(data_dir=tmp_path / "b"))
     run = _create_run(store_a, question="q")
 
     assert store_b.get(run.run_id) is None

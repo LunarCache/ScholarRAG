@@ -285,7 +285,7 @@ class ParserBenchmarkRunner:
             ]
             variant_root = comparison_root / variant
             variant_settings = self.settings.model_copy(
-                update={"data_dir": variant_root, "phoenix_endpoint": None}
+                update={"data_dir": variant_root},
             )
             variant_settings.ensure_directories()
             Catalog(variant_settings).register(

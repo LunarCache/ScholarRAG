@@ -26,7 +26,6 @@ from scholarrag.ingestion.quality import ParseQualityGate
 from scholarrag.ingestion.review import ParseReviewService
 from scholarrag.ingestion.service import IngestionService
 from scholarrag.maintenance import BackupService
-from scholarrag.observability import configure_telemetry
 from scholarrag.providers.mineru import MinerUClient
 from scholarrag.providers.paddleocr import PaddleOCRAPIClient
 from scholarrag.providers.siliconflow import SiliconFlowClient
@@ -62,12 +61,6 @@ QUALITY_OUTPUT_OPTION = typer.Option(
 BACKUP_ARGUMENT = typer.Argument(..., dir_okay=False)
 VERIFY_BACKUP_ARGUMENT = typer.Argument(..., exists=True, dir_okay=False)
 SCALE_OUTPUT_ARGUMENT = typer.Argument(Path("data/benchmarks/scale/latest.json"), dir_okay=False)
-
-
-@app.callback()
-def configure() -> None:
-    """Configure trace export for every CLI workflow."""
-    configure_telemetry(get_settings())
 
 
 @app.command("check-config")

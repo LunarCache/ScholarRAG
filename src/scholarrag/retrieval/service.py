@@ -8,7 +8,6 @@ from pathlib import Path
 
 from scholarrag.config import Settings
 from scholarrag.domain.models import CanonicalDocument, Chunk, RetrievedChunk
-from scholarrag.observability import get_tracer
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer
 from scholarrag.retrieval.index import VectorIndex, VisualIndex
@@ -30,22 +29,13 @@ class RetrievalService:
         top_k: int = 8,
         events: EventSink | None = None,
     ) -> tuple[list[RetrievedChunk], dict[str, object]]:
-        with get_tracer().start_as_current_span("rag.retrieve") as span:
-            results, debug = await self._retrieve(
-                query,
-                document_ids=document_ids,
-                top_k=top_k,
-                events=events,
-            )
-            span.set_attribute("retrieval.result_count", len(results))
-            span.set_attribute("retrieval.dense_candidates", int(debug.get("dense_candidates", 0)))
-            span.set_attribute(
-                "retrieval.lexical_candidates", int(debug.get("lexical_candidates", 0))
-            )
-            for key in ("embedding_trace_id", "rerank_trace_id"):
-                if debug.get(key):
-                    span.set_attribute(f"provider.{key}", str(debug[key]))
-            return results, debug
+        results, debug = await self._retrieve(
+            query,
+            document_ids=document_ids,
+            top_k=top_k,
+            events=events,
+        )
+        return results, debug
 
     async def _retrieve(
         self,

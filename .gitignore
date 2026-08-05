@@ -96,7 +96,6 @@ artifacts/
 backups/
 .docker-empty/
 qdrant_storage/
-phoenix_storage/
 *.db
 *.db-shm
 *.db-wal

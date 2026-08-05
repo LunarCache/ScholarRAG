@@ -116,7 +116,6 @@ async def test_end_to_end_visual_evidence_chain(
 ) -> None:
     settings = Settings(
         data_dir=tmp_path / "data",
-        phoenix_endpoint=None,
         siliconflow_api_key="test-key",
     )
     source = tmp_path / "e2e.pdf"
@@ -179,7 +178,6 @@ async def test_end_to_end_quality_force_applies_with_disabled_switch(
     """Low-quality report forces images even with the cost switch off."""
     settings = Settings(
         data_dir=tmp_path / "data",
-        phoenix_endpoint=None,
         siliconflow_api_key="test-key",
         chat_include_visual_evidence=False,
     )

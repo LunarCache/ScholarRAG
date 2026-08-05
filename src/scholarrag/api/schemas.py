@@ -18,6 +18,9 @@ class QueryRequest(BaseModel):
     document_ids: list[str] | None = None
     top_k: int = Field(default=8, ge=1, le=20)
     agentic: bool = True
+    # True: tool-calling loop; False: hard-coded multi-step planner;
+    # None (default): follow the server-side agent_tool_calling setting.
+    tool_mode: bool | None = None
     conversation_id: str | None = None
     parent_run_id: str | None = None
 

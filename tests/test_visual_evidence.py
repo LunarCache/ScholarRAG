@@ -138,7 +138,7 @@ def make_retrieved_chunk(
 
 
 def settings(tmp_path: Path) -> Settings:
-    return Settings(data_dir=tmp_path / "data", phoenix_endpoint=None)
+    return Settings(data_dir=tmp_path / "data")
 
 
 # ---------------------------------------------------------------------------

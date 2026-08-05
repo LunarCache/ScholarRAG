@@ -58,6 +58,11 @@ class SiliconFlowClient:
         self.rerank_model = settings.rerank_model
         self.chat_model = settings.chat_model
         self.chat_enable_thinking = settings.chat_enable_thinking
+        self.chat_temperature = settings.chat_temperature
+        self.chat_top_p = settings.chat_top_p
+        self.chat_top_k = settings.chat_top_k
+        self.chat_min_p = settings.chat_min_p
+        self.chat_thinking_budget = settings.chat_thinking_budget
         self.max_retries = settings.provider_max_retries
         self.failure_threshold = settings.provider_circuit_failure_threshold
         self.circuit_cooldown = settings.provider_circuit_cooldown_seconds
@@ -138,17 +143,29 @@ class SiliconFlowClient:
         self,
         messages: list[dict[str, Any]],
         *,
-        temperature: float = 0.1,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        thinking_budget: int | None = None,
         response_format: dict[str, str] | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> ProviderResponse:
         payload: dict[str, Any] = {
             "model": self.chat_model,
             "messages": messages,
-            "temperature": temperature,
+            "temperature": (
+                self.chat_temperature if temperature is None else temperature
+            ),
             "enable_thinking": self.chat_enable_thinking,
         }
+        self._apply_sampling_params(payload, top_p=top_p, top_k=top_k, min_p=min_p)
+        if thinking_budget is not None:
+            payload["thinking_budget"] = thinking_budget
         if response_format:
             payload["response_format"] = response_format
+        if tools:
+            payload["tools"] = tools
         return await self._post("/chat/completions", payload)
 
     @asynccontextmanager
@@ -156,16 +173,28 @@ class SiliconFlowClient:
         self,
         messages: list[dict[str, Any]],
         *,
-        temperature: float = 0.1,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        min_p: float | None = None,
+        thinking_budget: int | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[ProviderStream]:
         payload = {
             "model": self.chat_model,
             "messages": messages,
-            "temperature": temperature,
+            "temperature": (
+                self.chat_temperature if temperature is None else temperature
+            ),
             "enable_thinking": self.chat_enable_thinking,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        self._apply_sampling_params(payload, top_p=top_p, top_k=top_k, min_p=min_p)
+        if thinking_budget is not None:
+            payload["thinking_budget"] = thinking_budget
+        if tools:
+            payload["tools"] = tools
         async with self.client.stream(
             "POST",
             f"{self.base_url}/chat/completions",
@@ -178,6 +207,20 @@ class SiliconFlowClient:
                     f"SiliconFlow /chat/completions failed ({response.status_code}): {body[:500]}"
                 )
             yield ProviderStream(response)
+
+    def _apply_sampling_params(
+        self,
+        payload: dict[str, Any],
+        *,
+        top_p: float | None,
+        top_k: int | None,
+        min_p: float | None,
+    ) -> None:
+        """Apply Qwen3 official sampling defaults unless overridden per call."""
+        payload["top_p"] = self.chat_top_p if top_p is None else top_p
+        payload["top_k"] = self.chat_top_k if top_k is None else top_k
+        if min_p is not None or self.chat_min_p > 0:
+            payload["min_p"] = self.chat_min_p if min_p is None else min_p
 
     async def list_models(self) -> ProviderResponse:
         response = await self.client.get(f"{self.base_url}/models", headers=self.headers)

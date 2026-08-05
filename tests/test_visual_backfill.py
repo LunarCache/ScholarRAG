@@ -231,7 +231,7 @@ def test_prepare_candidate_runs_backfill_when_enabled(tmp_path: Path) -> None:
             x0=240, y0=375, x1=745, y1=610, coordinate_space="normalized_0_1000"
         )
     )
-    service = IngestionService(Settings(data_dir=tmp_path / "data", phoenix_endpoint=None))
+    service = IngestionService(Settings(data_dir=tmp_path / "data"))
     parse_dir = tmp_path / "parse"
     manifest: dict[str, object] = {"status": "parsing"}
 
@@ -257,7 +257,6 @@ def test_prepare_candidate_skips_backfill_when_disabled(tmp_path: Path) -> None:
     service = IngestionService(
         Settings(
             data_dir=tmp_path / "data",
-            phoenix_endpoint=None,
             ingest_visual_backfill=False,
         )
     )

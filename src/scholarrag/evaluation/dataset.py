@@ -122,7 +122,9 @@ class EvaluationCandidateGenerator:
             "review_status": review_status,
             "generation_config": {
                 "model": self.settings.chat_model,
-                "temperature": 0,
+                "temperature": self.settings.chat_temperature,
+                "top_p": self.settings.chat_top_p,
+                "top_k": self.settings.chat_top_k,
                 "enable_thinking": self.settings.chat_enable_thinking,
                 "response_format": "json_object",
                 "output_token_limit": None,
@@ -157,7 +159,9 @@ class EvaluationCandidateGenerator:
                     },
                     {"role": "user", "content": self._prompt(paper, page_text, [sample])},
                 ],
-                temperature=0,
+                temperature=self.settings.chat_temperature,
+                top_p=self.settings.chat_top_p,
+                top_k=self.settings.chat_top_k,
                 response_format={"type": "json_object"},
             )
             payload = self._json_payload(response.data["choices"][0]["message"]["content"])
@@ -221,7 +225,9 @@ class EvaluationCandidateGenerator:
                     generator={
                         "kind": "siliconflow_page_grounded",
                         "model": self.settings.chat_model,
-                        "temperature": 0,
+                        "temperature": self.settings.chat_temperature,
+                        "top_p": self.settings.chat_top_p,
+                        "top_k": self.settings.chat_top_k,
                         "enable_thinking": self.settings.chat_enable_thinking,
                         "response_format": "json_object",
                         "output_token_limit": None,

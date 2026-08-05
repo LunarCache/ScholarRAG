@@ -51,11 +51,13 @@ ScholarRAG 将解析版本、检索候选、Agent 步骤、模型调用、引用
 - **统一多模态空间**：Query、文本块和图片统一使用 `Qwen/Qwen3-VL-Embedding-8B` 的 1024 维向量。
 - **混合检索**：SQLite FTS5、Qdrant Text Dense 与 Visual Dense 并行召回，经 RRF 融合和 `Qwen/Qwen3-VL-Reranker-8B` 多模态精排。
 - **受控 Agentic RAG**：问题分类、Planner、子问题迭代、证据缺口检查、停止原因和简单问题降级均可审计。
+- **工具调用型 Agentic RAG**：检索原语（`list_papers` / `get_paper` / `retrieve` / `read_chunk`）封装为 OpenAI 兼容工具，模型自主决策搜索顺序；思考过程与每次工具调用的参数、结果均流式输出到前端并可折叠查看；超时或失败自动降级到受控 RAG。Web 提供三档回答模式：工具 Agent（默认）、多步规划、单轮检索。
+- **多轮会话**：同一会话内的追问自动携带父轮问题与回答上下文（`conversation_id` / `parent_run_id`），Chat Dock 以问答线程呈现历史轮次的回答、引用与 Claim 审计；恢复历史轨迹会接管其会话。
 - **细粒度引用**：回答中的 `[C#]` 可定位到 claim、evidence span、chunk/block、页码和 bbox，并跳回原 PDF 页面。
 - **实时执行轨迹**：异步 Query Run、追加式事件日志、SSE、断线重连、取消、终态对账和历史恢复。
 - **自动评测**：Ragas 0.4、检索/排序指标、引用完整性指标，以及独立的持久化 Judge 任务。
 - **视觉证据闭环**：OCR 负责定位与引用，VLM 在生成阶段直接读取图/表块图片（含 bbox 渲染兜底与质量路由门控），弥补公式、表格、复杂图表的文本损失；检索命中的图/表图片不设数量上限，全部附带以保证回答质量。
-- **可观测与可部署**：OpenTelemetry、Phoenix、质量/时延/费用看板、Docker Compose、备份校验和容量基准。
+- **可观测与可部署**：质量/时延/费用看板、Docker Compose、备份校验和容量基准。
 
 ## 系统架构
 
@@ -73,7 +75,7 @@ ScholarRAG 将解析版本、检索候选、Agent 步骤、模型调用、引用
 | Rerank | `Qwen/Qwen3-VL-Reranker-8B`，文本 + caption + 原始图片对象 |
 | Generation / Judge | `Qwen/Qwen3.6-27B`，thinking enabled |
 | Evaluation | Ragas 0.4 + retrieval/citation metrics + EasyDataset adapter |
-| Observability | Append-only Query Run、SSE、OpenTelemetry、Arize Phoenix |
+| Observability | Append-only Query Run、SSE |
 | Deployment | Docker multi-stage images、Docker Compose |
 
 ## 快速开始
@@ -137,15 +139,9 @@ npm run dev
 - Web：<http://localhost:3000>
 - OpenAPI：<http://localhost:8000/docs>
 
-Phoenix 是可选项。若不运行 Phoenix，可在 `.env` 中将 `SCHOLARRAG_PHOENIX_ENDPOINT` 留空；需要 Trace UI 时执行：
-
-```bash
-docker compose up -d phoenix
-```
-
 ### 4. Docker Compose
 
-填写 `.env` 后，可启动 Web、API、Qdrant 和 Phoenix：
+填写 `.env` 后，可启动 Web、API 和 Qdrant：
 
 ```bash
 docker compose up --build
@@ -158,7 +154,6 @@ docker compose up --build
 | Web | <http://localhost:3000> |
 | API | <http://localhost:8000> |
 | Qdrant | <http://localhost:6333> |
-| Phoenix | <http://localhost:6006> |
 
 停止服务：
 
@@ -206,6 +201,16 @@ POST /api/query-runs/{run_id}/cancel
 
 事件先追加写入 `events.jsonl`，再通过 SSE 推送。终态快照和 terminal event 原子提交，前端在完成、失败或取消时重新与持久化 event log 对账。
 
+Web composer 提供三档回答模式（默认「工具 Agent」）：
+
+| 模式 | 请求体 | 行为 |
+| --- | --- | --- |
+| 工具 Agent | `agentic=true, tool_mode=true` | 模型自主调用检索工具，思考与工具调用流式可审计 |
+| 多步规划 | `agentic=true, tool_mode=false` | 受控 Planner 拆解子问题并迭代检索 |
+| 单轮检索 | `agentic=false` | 一次混合检索直接生成，最快 |
+
+同一会话（`conversation_id`）内的追问会携带 `parent_run_id`，后端将父轮问题与回答（截断 4000 字符）并入当前问题，并记录 `conversation.context` 事件以便审计。
+
 ### 运行 Ragas
 
 Web 中可以对已完成问题点击“用 Ragas 复评”；CLI 支持 JSON 或 JSONL 数据集：
@@ -236,7 +241,6 @@ uv run scholarrag evaluate evals/your-dataset.jsonl
 | `SCHOLARRAG_CHAT_VISUAL_MAX_EDGE` | `1024`；图片最长边缩放上限（128–4096） |
 | `SCHOLARRAG_INGEST_VISUAL_BACKFILL` | `true`；图/表块缺图时按 bbox 从 PDF 渲染裁剪 |
 | `SCHOLARRAG_RAGAS_JUDGE_MODEL` | `Qwen/Qwen3.6-27B` |
-| `SCHOLARRAG_PHOENIX_ENDPOINT` | OTLP HTTP endpoint；留空可禁用 |
 | `SCHOLARRAG_API_BEARER_TOKEN` | 可选的 API Bearer 鉴权 |
 
 Judge 使用 262,144 tokens 上下文、`temperature=0` 和 thinking；评测客户端不发送输出 token 上限。具体配置以 [`.env.example`](.env.example) 为准。
@@ -360,13 +364,6 @@ docker compose build
 - 后续可扩展 PostgreSQL、对象存储、多用户 RBAC、任务队列和持续回归门禁。
 
 ## 常见问题
-
-<details>
-<summary><strong>是否必须运行 Phoenix？</strong></summary>
-
-不需要。Phoenix 只用于查看 OpenTelemetry Trace；将 `SCHOLARRAG_PHOENIX_ENDPOINT` 留空即可禁用，不影响解析、检索和问答。
-
-</details>
 
 <details>
 <summary><strong>为什么仓库中没有示例论文和运行数据？</strong></summary>

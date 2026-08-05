@@ -13,6 +13,7 @@ from scholarrag.domain.models import Answer, RetrievedChunk
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer, StageStatus, TraceEvent
 from scholarrag.rag.service import SYSTEM_PROMPT, RAGService
+from scholarrag.rag.tool_agent import ToolAgentService
 from scholarrag.rag.visual_routing import (
     load_quality_reports,
     merge_routing_decisions,
@@ -78,10 +79,17 @@ class PrefixedEventSink:
 class AgenticRAGService:
     """Bounded, auditable planner that degrades to the controlled RAG workflow."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, *, tool_calling: bool | None = None
+    ) -> None:
         self.settings = settings
+        # None defers to the server-side setting; the API can override per request.
+        self.tool_calling = (
+            settings.agent_tool_calling if tool_calling is None else tool_calling
+        )
         self.retrieval = RetrievalService(settings)
         self.controlled = RAGService(settings)
+        self.tool_agent = ToolAgentService(settings)
 
     async def answer(
         self,
@@ -118,6 +126,26 @@ class AgenticRAGService:
                 output=plan.model_dump(mode="json"),
                 summary=f"{len(plan.subqueries)} 个子问题，工具：{', '.join(plan.tools)}",
             )
+        if self.tool_calling:
+            # An explicit tool-calling request always uses the tool loop, even
+            # for "simple" questions: the model itself decides how many search
+            # rounds to run, and the trace stays consistent across turns (the
+            # rule-based planner would otherwise downgrade short factual first
+            # questions to controlled RAG while follow-ups — whose context is
+            # padded with the parent answer — always stayed multi-step).
+            # The tool loop manages its own timeout budget and falls back to
+            # the controlled workflow internally, so no outer timeout here.
+            answer = await self.tool_agent.answer(
+                question,
+                document_ids=document_ids,
+                top_k=top_k,
+                events=events,
+                trace_id=trace_id,
+            )
+            if "agent_plan" not in answer.retrieval_debug:
+                answer.retrieval_debug["agent_plan"] = plan.model_dump(mode="json")
+            return answer
+
         if plan.mode == "controlled_rag":
             await pipeline.skip(
                 "agent.evidence_gap",
@@ -442,7 +470,10 @@ class AgenticRAGService:
                 if 1 <= int(value) <= len(retrieved)
             }
         )
-        citations = [RAGService._citation(retrieved[index - 1], index) for index in referenced]
+        citations = [
+            RAGService._citation(retrieved[index - 1], index, catalog=Catalog(self.settings))
+            for index in referenced
+        ]
         claims = RAGService._claims(answer_text, retrieved)
         if events:
             await events.emit(

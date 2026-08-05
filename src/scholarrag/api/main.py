@@ -12,7 +12,6 @@ import anyio
 from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 from scholarrag.api.schemas import (
     CollectionRequest,
@@ -43,7 +42,6 @@ from scholarrag.evaluation.jobs import EvaluationJobStore
 from scholarrag.evaluation.service import EvaluationCase, RagasEvaluator
 from scholarrag.ingestion.review import ParseReviewError, ParseReviewService
 from scholarrag.ingestion.service import IngestionService
-from scholarrag.observability import configure_telemetry, get_tracer
 from scholarrag.rag.agent import AgenticRAGService
 from scholarrag.rag.runs import QueryRunStore, utc_now
 from scholarrag.rag.service import RAGService
@@ -73,7 +71,6 @@ class Runtime:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    configure_telemetry(settings)
     runtime = Runtime(settings)
 
     @asynccontextmanager
@@ -428,7 +425,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/query", response_model=QueryResponse)
     async def query(request: QueryRequest) -> QueryResponse:
-        service = AgenticRAGService(settings) if request.agentic else RAGService(settings)
+        service = (
+            AgenticRAGService(settings, tool_calling=request.tool_mode)
+            if request.agentic
+            else RAGService(settings)
+        )
         answer = await service.answer(
             request.question,
             document_ids=request.document_ids,
@@ -443,6 +444,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             document_ids=request.document_ids,
             top_k=request.top_k,
             agentic=request.agentic,
+            tool_mode=request.tool_mode,
             conversation_id=request.conversation_id,
             parent_run_id=request.parent_run_id,
         )
@@ -724,7 +726,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             current = await runtime.evaluation_jobs.cancel(job_id)
         return EvaluationJobResponse.model_validate(current.model_dump())
 
-    FastAPIInstrumentor.instrument_app(app)
     return app
 
 
@@ -779,18 +780,8 @@ async def _run_ingestion(runtime: Runtime, job_id: str, path: Path) -> None:
     job = runtime.jobs.get(job_id)
     if job is None:
         return
-    tracer = get_tracer()
     try:
-        with tracer.start_as_current_span("document.ingest") as span:
-            span.set_attribute("document.filename", job.filename)
-            document, _, parse_dir = await IngestionService(runtime.settings).ingest(path)
-            span.set_attribute("document.id", document.document_id)
-            manifest = json.loads((parse_dir / "manifest.json").read_text(encoding="utf-8"))
-            quality = manifest.get("quality") or {}
-            span.set_attribute("document.parse.quality_score", quality.get("score", 0.0))
-            span.set_attribute(
-                "document.parse.quality_decision", quality.get("decision", "unknown")
-            )
+        document, _, _ = await IngestionService(runtime.settings).ingest(path)
         runtime.jobs.complete(
             job_id,
             document_id=document.document_id,
@@ -833,7 +824,9 @@ async def _run_query(runtime: Runtime, run_id: str) -> None:
                     input={"parent_run_id": parent.run_id},
                 )
         service = (
-            AgenticRAGService(runtime.settings) if run.agentic else RAGService(runtime.settings)
+            AgenticRAGService(runtime.settings, tool_calling=run.tool_mode)
+            if run.agentic
+            else RAGService(runtime.settings)
         )
         answer = await service.answer(
             contextual_question,
