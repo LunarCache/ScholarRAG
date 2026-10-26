@@ -143,6 +143,8 @@ class VectorIndex:
         parse_ids: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
+        if document_ids == [] or parse_ids == []:
+            return []
         client = self._client()
         try:
             if not client.collection_exists(self.collection):
@@ -302,6 +304,8 @@ class VisualIndex:
         parse_ids: list[str] | None,
         limit: int,
     ) -> list[tuple[str, float]]:
+        if document_ids == [] or parse_ids == []:
+            return []
         client = self._client()
         try:
             if not client.collection_exists(self.collection):

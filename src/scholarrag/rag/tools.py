@@ -19,10 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from scholarrag.authorization import current_guard
 from scholarrag.config import Settings
+from scholarrag.domain.access import AccessContext, AccessDenied
 from scholarrag.domain.models import BlockKind, Chunk, RetrievedChunk, VisualEvidence
+from scholarrag.rag.scope import DocumentScope
 from scholarrag.retrieval.service import RetrievalService
 from scholarrag.storage.catalog import Catalog
+from scholarrag.storage.identity import IdentityStore
 
 _PREVIEW_CHARS = 500
 _FULL_CHUNK_CHARS = 6_000
@@ -68,13 +72,38 @@ class ToolRuntime:
         *,
         document_ids: list[str] | None = None,
         top_k: int = 8,
+        authorized_document_ids: list[str] | None = None,
+        access_context: AccessContext | None = None,
+        identities: IdentityStore | None = None,
     ) -> None:
         self.settings = settings
         self.registry = registry
         self.catalog = Catalog(settings)
         self.retrieval = RetrievalService(settings)
         self.default_document_ids = document_ids
+        self.scope = DocumentScope.intersect(document_ids, authorized_document_ids)
         self.default_top_k = top_k
+        if settings.auth_mode == "session" and access_context is None:
+            guard = current_guard(settings)
+            access_context, identities = guard.context, guard.identities
+            self.scope = DocumentScope.intersect(self.scope.resolve(), list(guard.document_ids))
+        if (access_context is None) != (identities is None):
+            raise ValueError("Access context and identity store must be supplied together")
+        if settings.auth_mode == "session" and access_context is None:
+            raise AccessDenied("Session mode requires a server-created access context")
+        self.access_context = access_context
+        self.identities = identities
+        if access_context is not None:
+            self.scope = DocumentScope.intersect(
+                self.scope.resolve(), identities.document_ids(access_context)
+            )
+        self._initial_scope = self.scope
+
+    def refresh_scope(self) -> None:
+        if self.access_context is not None:
+            self.scope = DocumentScope.intersect(
+                self._initial_scope.resolve(), self.identities.document_ids(self.access_context)
+            )
 
 
 ToolHandler = Callable[[ToolRuntime, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -128,9 +157,10 @@ def _canonical_path(runtime: ToolRuntime, parse_id: str) -> Path | None:
 
 
 async def _handle_list_papers(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    runtime.refresh_scope()
     query = str(args.get("query") or "").strip().casefold()
     limit = int(args.get("limit") or 20)
-    documents = runtime.catalog.list_documents()
+    documents = runtime.catalog.list_documents(runtime.scope.resolve())
     if query:
         documents = [
             doc
@@ -147,7 +177,10 @@ async def _handle_list_papers(runtime: ToolRuntime, args: dict[str, Any]) -> dic
 
 
 async def _handle_get_paper(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    runtime.refresh_scope()
     document_id = str(args.get("document_id") or "")
+    if not runtime.scope.allows(document_id):
+        return {"error": "论文不可用或不在当前范围中", "paper": None}
     doc = runtime.catalog.get_document(document_id)
     if doc is None:
         return {"error": f"论文 {document_id!r} 不存在", "papers": None}
@@ -186,19 +219,27 @@ async def _handle_get_paper(runtime: ToolRuntime, args: dict[str, Any]) -> dict[
 
 
 async def _handle_retrieve(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    runtime.refresh_scope()
     query = str(args.get("query") or "").strip()
     if not query:
         return {"error": "query 不能为空", "candidates": []}
-    document_ids = args.get("document_ids") or runtime.default_document_ids
+    document_ids = runtime.scope.resolve(args.get("document_ids"))
+    if document_ids == []:
+        return {"query": query, "candidate_count": 0, "candidates": []}
     top_k = max(1, min(int(args.get("top_k") or runtime.default_top_k), 12))
     results, _debug = await runtime.retrieval.retrieve(
         query,
-        document_ids=document_ids or None,
+        document_ids=document_ids,
         top_k=top_k,
         events=None,
     )
     candidates: list[dict[str, Any]] = []
+    runtime.refresh_scope()
     for item in results:
+        if not runtime.scope.allows(item.chunk.document_id) or (
+            document_ids is not None and item.chunk.document_id not in document_ids
+        ):
+            continue
         index = runtime.registry.register(item)
         chunk = item.chunk
         candidates.append(
@@ -222,16 +263,21 @@ async def _handle_retrieve(runtime: ToolRuntime, args: dict[str, Any]) -> dict[s
 
 
 async def _handle_read_chunk(runtime: ToolRuntime, args: dict[str, Any]) -> dict[str, Any]:
+    runtime.refresh_scope()
     chunk_id = str(args.get("chunk_id") or "")
     registered = runtime.registry.get(chunk_id)
     if registered is not None:
+        if not runtime.scope.allows(registered.chunk.document_id):
+            return {"error": "Chunk 不可用或不在当前范围中", "chunk": None}
         index = runtime.registry.register(registered)
         chunk = registered.chunk
     else:
-        loaded = runtime.catalog.chunks_by_ids([chunk_id])
+        loaded = runtime.catalog.chunks_by_ids([chunk_id], document_ids=runtime.scope.resolve())
         chunk = loaded.get(chunk_id)
         if chunk is None:
             return {"error": f"Chunk {chunk_id!r} 不存在或不在 active parse 中", "chunk": None}
+        if not runtime.scope.allows(chunk.document_id):
+            return {"error": "Chunk 不可用或不在当前范围中", "chunk": None}
         item = RetrievedChunk(chunk=chunk, score=0.0)
         index = runtime.registry.register(item)
     visuals = _attach_visuals(runtime, chunk)
@@ -276,8 +322,7 @@ def _attach_visuals(runtime: ToolRuntime, chunk: Chunk) -> list[VisualEvidence]:
                 image_path=str(resolved),
                 page_number=chunk.page_numbers[0] if chunk.page_numbers else 1,
                 caption=(
-                    f"{chunk.section_path[-1] if chunk.section_path else '图'}"
-                    f"（{resolved.name}）"
+                    f"{chunk.section_path[-1] if chunk.section_path else '图'}（{resolved.name}）"
                 ),
             )
         )

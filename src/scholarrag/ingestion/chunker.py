@@ -118,10 +118,16 @@ class SemanticChunker:
         parent_chunk_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> Chunk:
-        text = "\n\n".join(
+        block_texts = [
             block.markdown or block.text or str(block.metadata.get("caption_text") or "")
             for block in blocks
-        )
+        ]
+        text = "\n\n".join(block_texts)
+        offsets = []
+        cursor = 0
+        for block, block_text in zip(blocks, block_texts, strict=True):
+            offsets.append({"block_id": block.id, "start": cursor, "end": cursor + len(block_text)})
+            cursor += len(block_text) + 2
         section = blocks[-1].section_path if blocks else []
         prefix = " · ".join(part for part in (document.title, *section) if part)
         contextual = f"{prefix}\n\n{text}" if prefix else text
@@ -154,6 +160,11 @@ class SemanticChunker:
             sources=[block.source for block in blocks],
             level=level,
             parent_chunk_id=parent_chunk_id,
-            metadata={"chunk_index": index, "title": document.title, **(metadata or {})},
+            metadata={
+                "chunk_index": index,
+                "title": document.title,
+                **(metadata or {}),
+                "block_offsets": offsets,
+            },
             visual_evidence=visual_evidence,
         )

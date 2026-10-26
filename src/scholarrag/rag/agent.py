@@ -79,14 +79,10 @@ class PrefixedEventSink:
 class AgenticRAGService:
     """Bounded, auditable planner that degrades to the controlled RAG workflow."""
 
-    def __init__(
-        self, settings: Settings, *, tool_calling: bool | None = None
-    ) -> None:
+    def __init__(self, settings: Settings, *, tool_calling: bool | None = None) -> None:
         self.settings = settings
         # None defers to the server-side setting; the API can override per request.
-        self.tool_calling = (
-            settings.agent_tool_calling if tool_calling is None else tool_calling
-        )
+        self.tool_calling = settings.agent_tool_calling if tool_calling is None else tool_calling
         self.retrieval = RetrievalService(settings)
         self.controlled = RAGService(settings)
         self.tool_agent = ToolAgentService(settings)

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class BlockKind(StrEnum):
@@ -135,6 +135,8 @@ class EvidenceSpan(BaseModel):
     quote: str
     start_char: int = Field(ge=0)
     end_char: int = Field(ge=0)
+    parse_id: str | None = None
+    location_status: Literal["exact", "approximate"] = "approximate"
 
 
 class ClaimCitation(BaseModel):
@@ -145,6 +147,19 @@ class ClaimCitation(BaseModel):
     citation_ids: list[str] = Field(default_factory=list)
     evidence_spans: list[EvidenceSpan] = Field(default_factory=list)
     supported: bool = False
+    evidence_located: bool = False
+    support_status: Literal["not_checked", "supported", "contradicted", "insufficient"] = (
+        "not_checked"
+    )
+
+    @model_validator(mode="after")
+    def normalize_evidence_state(self) -> Self:
+        # Legacy stored `supported=true` meant only that a span was found.
+        self.evidence_located = bool(self.evidence_spans)
+        if self.support_status == "supported" and not self.evidence_located:
+            self.support_status = "insufficient"
+        self.supported = self.support_status == "supported" and self.evidence_located
+        return self
 
 
 class RetrievedChunk(BaseModel):

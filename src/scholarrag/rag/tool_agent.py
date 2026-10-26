@@ -22,8 +22,11 @@ import time
 import uuid
 from typing import Any
 
+from jsonschema import Draft202012Validator
+
 from scholarrag.config import Settings
 from scholarrag.domain.models import Answer
+from scholarrag.observability import observe
 from scholarrag.providers.siliconflow import SiliconFlowClient
 from scholarrag.rag.runs import EventSink, PipelineTracer
 from scholarrag.rag.service import SYSTEM_PROMPT, RAGService
@@ -66,6 +69,10 @@ class ToolAgentService:
         events: EventSink | None = None,
         trace_id: str | None = None,
     ) -> Answer:
+        if document_ids == []:
+            return await self.controlled.answer(
+                question, document_ids=[], top_k=top_k, events=events, trace_id=trace_id
+            )
         specs = build_tool_specs()
         registry = EvidenceRegistry()
         runtime = ToolRuntime(
@@ -130,7 +137,9 @@ class ToolAgentService:
                     usage=usage,
                     provider_trace_id=provider_trace_id,
                 )
-            return await self._fallback(question, document_ids, top_k, events, trace_id, "timeout_fallback")
+            return await self._fallback(
+                question, document_ids, top_k, events, trace_id, "timeout_fallback"
+            )
         except Exception as exc:  # noqa: BLE001 - degrade instead of failing the run
             if events:
                 await events.emit(
@@ -247,7 +256,12 @@ class ToolAgentService:
                         )
                 results = await asyncio.gather(
                     *(
-                        self._execute_tool(specs=by_name, name=call["name"], args=call["arguments"], runtime=runtime)
+                        self._execute_tool(
+                            specs=by_name,
+                            name=call["name"],
+                            args=call["arguments"],
+                            runtime=runtime,
+                        )
                         for call in tool_calls
                     )
                 )
@@ -360,9 +374,7 @@ class ToolAgentService:
                     thinking_parts.append(str(reasoning))
                     pending_thinking += str(reasoning)
                     now = time.perf_counter()
-                    if events and (
-                        len(pending_thinking) >= 60 or now - last_emit >= 0.15
-                    ):
+                    if events and (len(pending_thinking) >= 60 or now - last_emit >= 0.15):
                         await events.emit(
                             event_type="agent.thinking.delta",
                             stage_id="agent.think",
@@ -428,10 +440,14 @@ class ToolAgentService:
             parsed = json.loads(args or "{}")
             if not isinstance(parsed, dict):
                 return None, "工具参数必须是 JSON 对象"
+            if not Draft202012Validator(spec.parameters).is_valid(parsed):
+                return None, "工具参数不符合 Schema"
         except json.JSONDecodeError as exc:
             return None, f"工具参数 JSON 解析失败: {exc}"
         try:
-            result = await spec.handler(runtime, parsed)
+            with observe(f"tool.{name}", as_type="tool", input=parsed) as observation:
+                result = await spec.handler(runtime, parsed)
+                observation.update(output=result)
             return result, None
         except Exception as exc:  # noqa: BLE001 - tool errors feed back to the model
             return None, f"{type(exc).__name__}: {exc}"
@@ -451,8 +467,7 @@ class ToolAgentService:
     ) -> Answer:
         retrieved = registry.pool
         contexts = "\n\n".join(
-            RAGService._format_context(item, index)
-            for index, item in enumerate(retrieved, start=1)
+            RAGService._format_context(item, index) for index, item in enumerate(retrieved, start=1)
         )[: self.settings.agent_max_context_chars]
         reports_sources = {item.chunk.document_id for item in retrieved}
         has_visual = any(item.chunk.visual_evidence for item in retrieved)

@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-26",
+  "document_pages": 2,
+  "query_runs": 2,
+  "completed": true,
+  "conversation_linked": true,
+  "event_counts": [
+    47,
+    47
+  ],
+  "forged_scope_status": 403,
+  "cross_workspace_denied": true,
+  "collection_delete_status": 204,
+  "generation_usage": [
+    {
+      "run_id": "run_bf11c81ea47d40aebe963fd807a0d1a0",
+      "usage": {
+        "prompt_tokens": 713,
+        "completion_tokens": 139,
+        "total_tokens": 852,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 713
+      },
+      "configured_estimate_cny": null
+    },
+    {
+      "run_id": "run_6db618f0a7564c3eb505a59a2ea11e0b",
+      "usage": {
+        "prompt_tokens": 529,
+        "completion_tokens": 134,
+        "total_tokens": 663,
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        },
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "prompt_cache_hit_tokens": 0,
+        "prompt_cache_miss_tokens": 529
+      },
+      "configured_estimate_cny": null
+    }
+  ],
+  "billing_reconciled": false,
+  "langfuse_export_verified": false,
+  "catalog_chunks": 3,
+  "indexed_text_vectors": 3,
+  "shared_document_private_state_isolated": true,
+  "private_document_phase_denials": {
+    "/documents/doc_d1425ca8396b44f99164fbe931b050f9/personal": 403,
+    "/query-runs/run_bf11c81ea47d40aebe963fd807a0d1a0": 403,
+    "/query-runs/run_bf11c81ea47d40aebe963fd807a0d1a0/events": 403,
+    "/query-runs/run_bf11c81ea47d40aebe963fd807a0d1a0/export": 403,
+    "/collections/col_bc8cb4ac07ce469e94e954b4081f0447": 403
+  },
+  "note_conflict_status": 409,
+  "collection_conflict_status": 409,
+  "note_revision": 2,
+  "collection_revision": 2,
+  "root_entry_mode": "session",
+  "provider_fallback": "off",
+  "generation_total_tokens": 1515,
+  "authorized_pdf_integrity_verified": true,
+  "workspace_switch_clears_browser_history": true,
+  "browser_note_conflict_preserves_draft": true,
+  "browser_collection_conflict_preserves_draft": true
+}

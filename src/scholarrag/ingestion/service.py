@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from scholarrag.authorization import check_active_authorization
 from scholarrag.config import Settings
 from scholarrag.domain.models import CanonicalDocument, Chunk
 from scholarrag.ingestion.chunker import SemanticChunker
@@ -37,7 +39,10 @@ class ParseCandidate:
 
 
 class IngestionService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, document_id: str | None = None) -> None:
+        if document_id is not None and not re.fullmatch(r"doc_[0-9a-f]{32}", document_id):
+            raise ValueError("Invalid allocated document ID")
+        self.document_id = document_id
         self.settings = settings
         self.store = ArtifactStore(settings)
         self.quality_gate = ParseQualityGate(
@@ -53,6 +58,7 @@ class IngestionService:
         existing_batch_id: str | None = None,
     ) -> tuple[CanonicalDocument, list[Chunk], Path]:
         """Parse with MinerU, optionally evaluate Paddle, then activate exactly one candidate."""
+        check_active_authorization()
         primary = await self._parse_mineru_candidate(source, existing_batch_id=existing_batch_id)
         fallback: ParseCandidate | None = None
         fallback_error: str | None = None
@@ -126,7 +132,7 @@ class IngestionService:
     ) -> ParseCandidate:
         source = source.resolve()
         source_hash = self.store.sha256(source)
-        document_id = f"doc_{source_hash[:24]}"
+        document_id = self.document_id or f"doc_{source_hash[:24]}"
         parse_id = self._parse_id("mineru", self.settings.mineru_model)
         parse_dir = self.store.parse_dir(document_id, parse_id)
         preserved_source, _ = self.store.preserve_source(source, document_id)
@@ -167,21 +173,26 @@ class IngestionService:
         finally:
             await client.close()
 
-        document = MinerUNormalizer().normalize(
-            raw_dir,
-            document_id=document_id,
-            parse_id=parse_id,
-            source_sha256=source_hash,
-            source_filename=source.name,
-            provider_model=self.settings.mineru_model,
-        )
-        manifest["query_trace_id"] = response.get("trace_id")
-        return self._prepare_candidate(document, parse_dir, preserved_source, manifest=manifest)
+        try:
+            document = MinerUNormalizer().normalize(
+                raw_dir,
+                document_id=document_id,
+                parse_id=parse_id,
+                source_sha256=source_hash,
+                source_filename=source.name,
+                provider_model=self.settings.mineru_model,
+            )
+            manifest["query_trace_id"] = response.get("trace_id")
+            return self._prepare_candidate(document, parse_dir, preserved_source, manifest=manifest)
+        except Exception as exc:
+            self._mark_failed(manifest_path, manifest, exc)
+            raise
 
     async def _parse_paddle_candidate(self, source: Path) -> ParseCandidate:
+        check_active_authorization()
         source = source.resolve()
         source_hash = self.store.sha256(source)
-        document_id = f"doc_{source_hash[:24]}"
+        document_id = self.document_id or f"doc_{source_hash[:24]}"
         parse_id = self._parse_id("paddleocr", self.settings.paddle_model)
         parse_dir = self.store.parse_dir(document_id, parse_id)
         preserved_source, _ = self.store.preserve_source(source, document_id)
@@ -304,6 +315,7 @@ class IngestionService:
         decision: ParseRouteDecision,
         route_path: Path,
     ) -> None:
+        check_active_authorization()
         if self.settings.parse_quality_mode == "enforce" and decision.recommended_action in {
             "manual_review",
             "run_fallback",
@@ -316,6 +328,7 @@ class IngestionService:
             candidate.document, candidate.chunks
         )
         catalog = Catalog(self.settings)
+        check_active_authorization()
         catalog.register(
             candidate.document,
             candidate.chunks,

@@ -9,7 +9,6 @@ from scholarrag.evaluation.jobs import EvaluationJob
 from scholarrag.evaluation.service import EvaluationCase, EvaluationRun
 from scholarrag.ingestion.review import ParseReviewResult, ParseVersion
 from scholarrag.rag.runs import QueryRun
-from scholarrag.storage.jobs import IngestionJob
 from scholarrag.storage.library import Collection, PersonalPaperState
 
 
@@ -23,15 +22,6 @@ class QueryRequest(BaseModel):
     tool_mode: bool | None = None
     conversation_id: str | None = None
     parent_run_id: str | None = None
-
-
-class UploadAccepted(BaseModel):
-    job_id: str
-    status: Literal["queued"] = "queued"
-
-
-class JobStatus(IngestionJob):
-    pass
 
 
 class ParseReviewRequest(BaseModel):

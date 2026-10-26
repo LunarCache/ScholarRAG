@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+import httpx
 import typer
 
 from scholarrag.benchmark.parsers import ParserBenchmarkRunner
 from scholarrag.benchmark.scale import ScaleBenchmarkRunner
+from scholarrag.cli_auth import app as auth_app
 from scholarrag.config import get_settings
 from scholarrag.domain.models import CanonicalDocument, Chunk
 from scholarrag.evaluation.dataset import (
@@ -26,6 +29,7 @@ from scholarrag.ingestion.quality import ParseQualityGate
 from scholarrag.ingestion.review import ParseReviewService
 from scholarrag.ingestion.service import IngestionService
 from scholarrag.maintenance import BackupService
+from scholarrag.observability import Telemetry
 from scholarrag.providers.mineru import MinerUClient
 from scholarrag.providers.paddleocr import PaddleOCRAPIClient
 from scholarrag.providers.siliconflow import SiliconFlowClient
@@ -35,14 +39,12 @@ from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
 
 app = typer.Typer(no_args_is_help=True)
+app.add_typer(auth_app, name="auth")
 PDF_ARGUMENT = typer.Argument(..., exists=True, dir_okay=False, readable=True)
 WAIT_OPTION = typer.Option(True, help="Wait until parsing completes.")
 DOCUMENT_IDS_OPTION = typer.Option(None, "--document-id", "-d")
 EVALUATION_DATASET_ARGUMENT = typer.Argument(..., exists=True, dir_okay=False, readable=True)
 EVALUATION_TARGET_ARGUMENT = typer.Argument(..., dir_okay=False)
-BATCH_ID_OPTION = typer.Option(
-    None, help="Attach a completed MinerU batch instead of submitting another paid parse."
-)
 PAGE_RANGES_OPTION = typer.Option(None, help="Pages accepted by the provider, e.g. 1-8 or 1,3,5.")
 MINERU_PARSE_DIR_OPTION = typer.Option(
     None, exists=True, file_okay=False, readable=True, help="Completed MinerU parse to reuse."
@@ -73,6 +75,12 @@ def check_config() -> None:
                 "mineru": settings.mineru_api_token is not None,
                 "paddleocr": settings.paddleocr_access_token is not None,
                 "siliconflow": settings.siliconflow_api_key is not None,
+                "auth_mode": settings.auth_mode,
+                "langfuse_enabled": settings.langfuse_enabled,
+                "langfuse_configured": bool(
+                    settings.langfuse_public_key and settings.langfuse_secret_key
+                ),
+                "langfuse_capture_content": settings.langfuse_capture_content,
                 "parse_quality_mode": settings.parse_quality_mode,
                 "parse_quality_accept_score": settings.parse_quality_accept_score,
                 "parse_quality_review_score": settings.parse_quality_review_score,
@@ -84,6 +92,48 @@ def check_config() -> None:
             indent=2,
         )
     )
+
+
+@app.command("langfuse-smoke")
+def langfuse_smoke() -> None:
+    """Check Langfuse auth and export a synthetic trace without calling an LLM."""
+    telemetry = Telemetry(get_settings())
+    if telemetry.client is None:
+        raise typer.BadParameter("Enable SCHOLARRAG_LANGFUSE_ENABLED and configure project keys")
+
+    async def run() -> None:
+        try:
+            try:
+                authenticated = await asyncio.to_thread(telemetry.client.auth_check)
+            except Exception as exc:
+                raise typer.BadParameter(
+                    "Langfuse connection/auth failed; check URL and keys"
+                ) from exc
+            if not authenticated:
+                raise typer.BadParameter(
+                    "Langfuse authentication failed; check URL and project keys"
+                )
+            trace_id = uuid.uuid4().hex
+            with telemetry.trace(
+                "scholarrag.smoke",
+                trace_id=trace_id,
+                session_id="scholarrag-learning",
+                metadata={"synthetic": True},
+                input="Synthetic smoke test; no paper or LLM request",
+            ) as observation:
+                from scholarrag.observability import observe
+
+                with observe("example.retrieval", as_type="retriever"):
+                    pass
+                with observe("example.generation", as_type="generation", model="synthetic"):
+                    pass
+                observation.update(output="Smoke test finished")
+            await asyncio.to_thread(telemetry.client.flush)
+            typer.echo(json.dumps({"authenticated": True, "trace_id": trace_id, "synthetic": True}))
+        finally:
+            await asyncio.to_thread(telemetry.shutdown)
+
+    asyncio.run(run())
 
 
 @app.command("backup")
@@ -428,8 +478,20 @@ def ask(
     """Ask the indexed paper corpus a grounded question."""
 
     async def run() -> None:
-        answer = await AgenticRAGService(get_settings()).answer(question, document_ids=document_id)
-        typer.echo(answer.model_dump_json(indent=2))
+        settings = get_settings()
+        telemetry = Telemetry(settings)
+        try:
+            trace_id = uuid.uuid4().hex
+            with telemetry.trace(
+                "scholarrag.ask", trace_id=trace_id, input={"question": question}
+            ) as observation:
+                answer = await AgenticRAGService(settings).answer(
+                    question, document_ids=document_id, trace_id=trace_id
+                )
+                observation.update(output=answer.answer)
+                typer.echo(answer.model_dump_json(indent=2))
+        finally:
+            await asyncio.to_thread(telemetry.shutdown)
 
     asyncio.run(run())
 
@@ -589,34 +651,32 @@ def download_mineru(
 @app.command("ingest")
 def ingest(
     pdf: Path = PDF_ARGUMENT,
-    batch_id: str | None = BATCH_ID_OPTION,
+    workspace: str = typer.Option(..., help="Target workspace ID."),
+    api_url: str = typer.Option("http://127.0.0.1:8000", help="ScholarRAG session-mode API."),
+    idempotency_key: str | None = typer.Option(
+        None, help="Reuse this key when retrying the same upload."
+    ),
 ) -> None:
-    """Ingest a PDF through MinerU and build canonical blocks and chunks."""
-
-    async def run() -> None:
-        document, chunks, parse_dir = await IngestionService(get_settings()).ingest(
-            pdf, existing_batch_id=batch_id
-        )
-        manifest = json.loads((parse_dir / "manifest.json").read_text(encoding="utf-8"))
-        typer.echo(
-            json.dumps(
-                {
-                    "document_id": document.document_id,
-                    "parse_id": document.parse_id,
-                    "title": document.title,
-                    "pages": len(document.pages),
-                    "blocks": len(document.blocks),
-                    "chunks": len(chunks),
-                    "quality": manifest.get("quality"),
-                    "routing": manifest.get("routing"),
-                    "artifact_dir": str(parse_dir),
-                },
-                ensure_ascii=False,
-                indent=2,
+    """Submit to the unified workspace queue; never call a paid parser directly."""
+    token = os.environ.get("SCHOLARRAG_SESSION_TOKEN", "").strip()
+    if not token:
+        raise typer.BadParameter("Set SCHOLARRAG_SESSION_TOKEN to an issued user session token")
+    key = idempotency_key or uuid.uuid4().hex
+    typer.echo(json.dumps({"idempotency_key": key}), err=True)
+    try:
+        with pdf.open("rb") as source, httpx.Client(timeout=300) as client:
+            response = client.post(
+                f"{api_url.rstrip('/')}/api/workspaces/{workspace}/uploads",
+                headers={"Authorization": f"Bearer {token}", "Idempotency-Key": key},
+                files={"file": (pdf.name, source, "application/pdf")},
             )
-        )
-
-    asyncio.run(run())
+    except (OSError, httpx.HTTPError) as exc:
+        raise typer.BadParameter(
+            f"Upload failed ({type(exc).__name__}); retry with the same idempotency key"
+        ) from None
+    if response.status_code != 202:
+        raise typer.BadParameter(f"Upload rejected (HTTP {response.status_code})")
+    typer.echo(json.dumps(response.json(), ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

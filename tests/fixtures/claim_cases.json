@@ -1,0 +1,11 @@
+{
+  "schema_version": "1.0",
+  "provenance": "handwritten synthetic regression examples; not reviewed paper Gold",
+  "cases": [
+    {"id": "matching-number", "evidence": "Recall improved by 12.5%.", "answer": "Recall improved by 12.5% [C1].", "located": true},
+    {"id": "contradictory-number", "evidence": "Recall improved by 12.5%.", "answer": "Recall improved by 90% [C1].", "located": true},
+    {"id": "irrelevant-citation", "evidence": "Experiments use dataset Alpha.", "answer": "The algorithm has linear complexity [C1].", "located": true},
+    {"id": "missing-citation", "evidence": "Recall improved by 12.5%.", "answer": "Recall improved by 12.5%.", "located": false},
+    {"id": "invalid-citation", "evidence": "Recall improved by 12.5%.", "answer": "Recall improved by 12.5% [C99].", "located": false}
+  ]
+}

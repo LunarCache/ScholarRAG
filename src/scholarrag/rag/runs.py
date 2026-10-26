@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from scholarrag.config import Settings
 from scholarrag.domain.models import Answer
+from scholarrag.observability import observe
 
 RunStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 StageStatus = Literal["pending", "running", "success", "skipped", "warning", "failed", "cancelled"]
@@ -55,6 +57,9 @@ class QueryRun(BaseModel):
     tool_mode: bool | None = None
     conversation_id: str | None = None
     parent_run_id: str | None = None
+    workspace_id: str | None = None
+    owner_id: str | None = None
+    actor_session_id: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -162,6 +167,36 @@ class PipelineTracer:
         model: str | None = None,
         input: dict[str, Any] | None = None,
     ) -> AsyncIterator[StageCapture]:
+        with observe(
+            stage_id,
+            input=input,
+            metadata={"component": component, "label": label, "parent_stage_id": parent_stage_id},
+        ) as observation:
+            async with self._stage(
+                stage_id,
+                label,
+                parent_stage_id=parent_stage_id,
+                component=component,
+                model=model,
+                input=input,
+            ) as capture:
+                yield capture
+                observation.update(
+                    output=capture.output,
+                    level="WARNING" if capture.status == "warning" else "DEFAULT",
+                )
+
+    @asynccontextmanager
+    async def _stage(
+        self,
+        stage_id: str,
+        label: str,
+        *,
+        parent_stage_id: str | None = None,
+        component: str | None = None,
+        model: str | None = None,
+        input: dict[str, Any] | None = None,
+    ) -> AsyncIterator[StageCapture]:
         started = time.perf_counter()
         if self.sink:
             await self.sink.emit(
@@ -250,8 +285,15 @@ class PipelineTracer:
 class QueryRunStore:
     """Append-only event artifacts plus recoverable run snapshots."""
 
-    def __init__(self, settings: Settings) -> None:
-        self.root = settings.data_dir / "query_runs"
+    def __init__(self, settings: Settings, *, workspace_id: str | None = None) -> None:
+        if workspace_id is not None and not re.fullmatch(r"ws_[0-9a-f]{32}", workspace_id):
+            raise ValueError("Invalid workspace storage namespace")
+        root = (
+            settings.data_dir
+            if workspace_id is None
+            else settings.data_dir / "workspaces" / workspace_id
+        )
+        self.root = root / "query_runs"
         self.root.mkdir(parents=True, exist_ok=True)
         self._locks: dict[str, asyncio.Lock] = {}
         self._conditions: dict[str, asyncio.Condition] = {}
@@ -266,6 +308,9 @@ class QueryRunStore:
         tool_mode: bool | None = None,
         conversation_id: str | None = None,
         parent_run_id: str | None = None,
+        workspace_id: str | None = None,
+        owner_id: str | None = None,
+        actor_session_id: str | None = None,
     ) -> QueryRun:
         run_id = f"run_{uuid.uuid4().hex}"
         run_dir = self.root / run_id
@@ -280,6 +325,9 @@ class QueryRunStore:
             tool_mode=tool_mode,
             conversation_id=conversation_id,
             parent_run_id=parent_run_id,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            actor_session_id=actor_session_id,
             artifact_dir=str(run_dir),
         )
         self._write_run(run)

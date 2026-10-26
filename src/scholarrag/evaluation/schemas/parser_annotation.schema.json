@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ScholarRAG parser annotation v1",
+  "type": "object",
+  "required": ["schema_version", "sample_id", "source_sha256", "source_filename", "page_number", "page_image_sha256", "status", "elements", "qa_cases", "annotation"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "sample_id": {"type": "string", "minLength": 1},
+    "source_sha256": {"$ref": "#/$defs/hash"},
+    "page_image_sha256": {"$ref": "#/$defs/hash"},
+    "source_filename": {"type": "string", "minLength": 1},
+    "page_number": {"type": "integer", "minimum": 1},
+    "status": {"enum": ["proposed", "annotated", "reviewed"]},
+    "tags": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string"},
+    "elements": {"type": "array", "items": {"$ref": "#/$defs/element"}},
+    "qa_cases": {"type": "array", "items": {"$ref": "#/$defs/qa"}},
+    "annotation": {
+      "type": "object",
+      "properties": {
+        "annotator": {"type": "string", "minLength": 1},
+        "reviewer": {"type": "string", "minLength": 1},
+        "annotated_at": {"type": "string", "format": "date-time"},
+        "reviewed_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+    "bbox": {
+      "type": "object",
+      "required": ["x0", "y0", "x1", "y1", "coordinate_space"],
+      "properties": {
+        "x0": {"type": "number"}, "y0": {"type": "number"},
+        "x1": {"type": "number"}, "y1": {"type": "number"},
+        "coordinate_space": {"enum": ["pixels", "normalized_0_1000", "pdf_points"]}
+      }
+    },
+    "element": {
+      "type": "object",
+      "required": ["element_id", "label", "bbox", "reading_order", "exclude_from_rag"],
+      "properties": {
+        "element_id": {"type": "string", "minLength": 1},
+        "label": {"enum": ["title", "heading", "paragraph", "list", "formula", "table", "figure", "caption", "code", "reference", "footnote", "header", "footer", "page_number", "unknown"]},
+        "bbox": {"$ref": "#/$defs/bbox"},
+        "reading_order": {"type": "integer", "minimum": 0},
+        "exclude_from_rag": {"type": "boolean"},
+        "text": {"type": "string"},
+        "caption_element_id": {"type": ["string", "null"]},
+        "parent_element_id": {"type": ["string", "null"]}
+      }
+    },
+    "qa": {
+      "type": "object",
+      "required": ["question", "answerable", "evidence_element_ids"],
+      "properties": {
+        "question": {"type": "string", "minLength": 1},
+        "answerable": {"type": "boolean"},
+        "answer": {"type": ["string", "null"]},
+        "evidence_element_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

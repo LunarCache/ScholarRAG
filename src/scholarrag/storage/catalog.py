@@ -179,15 +179,22 @@ class Catalog:
                         (chunk.id, chunk.document_id, chunk.contextual_text),
                     )
 
-    def list_documents(self) -> list[dict[str, Any]]:
+    def list_documents(self, document_ids: list[str] | None = None) -> list[dict[str, Any]]:
+        if document_ids == []:
+            return []
+        scope_filter = ""
+        if document_ids is not None:
+            scope_filter = f"WHERE d.document_id IN ({','.join('?' for _ in document_ids)})"
         with self._connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT d.*, p.parse_id, p.provider, p.provider_model, p.artifact_dir,
                        (SELECT COUNT(*) FROM chunks c WHERE c.parse_id=p.parse_id) AS chunk_count
                 FROM documents d JOIN parses p ON p.document_id=d.document_id AND p.active=1
+                {scope_filter}
                 ORDER BY d.created_at DESC
-                """
+                """,
+                document_ids or [],
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -232,6 +239,8 @@ class Catalog:
         return json.loads(row["metadata"]) if row else None
 
     def knowledge_graph(self, document_ids: list[str] | None = None) -> dict[str, Any]:
+        if document_ids == []:
+            return {"nodes": [], "edges": []}
         params: list[Any] = []
         where = ""
         if document_ids:
@@ -284,6 +293,8 @@ class Catalog:
         return dict(row) if row else None
 
     def active_parse_ids(self, document_ids: list[str] | None = None) -> list[str]:
+        if document_ids == []:
+            return []
         params: list[Any] = []
         where = "active=1"
         if document_ids:
@@ -339,25 +350,34 @@ class Catalog:
             connection.execute("UPDATE parses SET active=0 WHERE document_id=?", (document_id,))
             connection.execute("UPDATE parses SET active=1 WHERE parse_id=?", (parse_id,))
 
-    def chunks_by_ids(self, chunk_ids: Iterable[str]) -> dict[str, Chunk]:
+    def chunks_by_ids(
+        self, chunk_ids: Iterable[str], *, document_ids: list[str] | None = None
+    ) -> dict[str, Chunk]:
         ids = list(chunk_ids)
-        if not ids:
+        if not ids or document_ids == []:
             return {}
         placeholders = ",".join("?" for _ in ids)
+        scope_filter = ""
+        params = list(ids)
+        if document_ids is not None:
+            scope_filter = f" AND c.document_id IN ({','.join('?' for _ in document_ids)})"
+            params.extend(document_ids)
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
                 SELECT c.* FROM chunks c
                 JOIN parses p ON p.parse_id=c.parse_id AND p.active=1
-                WHERE c.chunk_id IN ({placeholders})
+                WHERE c.chunk_id IN ({placeholders}) {scope_filter}
                 """,
-                ids,
+                params,
             ).fetchall()
         return {row["chunk_id"]: self._row_to_chunk(row) for row in rows}
 
     def lexical_search(
         self, query: str, *, document_ids: list[str] | None = None, limit: int = 30
     ) -> list[tuple[str, float]]:
+        if document_ids == []:
+            return []
         match_query = self._fts_query(query)
         if not match_query:
             return []

@@ -58,6 +58,7 @@ ScholarRAG 将解析版本、检索候选、Agent 步骤、模型调用、引用
 - **自动评测**：Ragas 0.4、检索/排序指标、引用完整性指标，以及独立的持久化 Judge 任务。
 - **视觉证据闭环**：OCR 负责定位与引用，VLM 在生成阶段直接读取图/表块图片（含 bbox 渲染兜底与质量路由门控），弥补公式、表格、复杂图表的文本损失；检索命中的图/表图片不设数量上限，全部附带以保证回答质量。
 - **可观测与可部署**：质量/时延/费用看板、Docker Compose、备份校验和容量基准。
+- **可选 Langfuse**：问答 Trace、阶段与工具 Span、流式模型用量和会话归组；默认关闭导出与正文采集，接入步骤见 [Langfuse 学习指南](docs/LANGFUSE.md)。
 
 ## 系统架构
 
@@ -137,6 +138,7 @@ npm run dev
 访问：
 
 - Web：<http://localhost:3000>
+- 工作空间登录与上传：<http://localhost:3000/workspace>（API 需启用 session 模式）
 - OpenAPI：<http://localhost:8000/docs>
 
 ### 4. Docker Compose
@@ -165,13 +167,21 @@ docker compose down
 
 ### 上传论文
 
-推荐直接在 Web 中上传 PDF。也可以使用 CLI：
+上传已统一迁移到工作空间队列。先配置 `SCHOLARRAG_AUTH_MODE=session` 并启动 API，通过 `scholarrag auth` 创建用户、工作空间和会话；在调用 CLI 的终端设置 `SCHOLARRAG_SESSION_TOKEN`，再提交：
 
 ```bash
-uv run scholarrag ingest /path/to/paper.pdf
+uv run scholarrag ingest /path/to/paper.pdf --workspace ws_REPLACE
 ```
 
+命令返回排队任务；`--idempotency-key` 用于安全重试同一上传。v4 迁移会移除旧单用户任务与事件，论文与解析产物保留；默认库现已确认采用新结构，测试目录隔离更正见 [A16](docs/implementation/A16_BROWSER_SESSION.md)。浏览器已接通[工作空间登录](docs/implementation/A16_BROWSER_SESSION.md)和[统一上传](docs/implementation/A17_BROWSER_INGESTION.md)，访问 `http://localhost:3000/workspace` 使用管理员签发的会话令牌。初始化、接口、查询任务进度与迁移详情见[统一队列](docs/implementation/A14_UNIFIED_INGESTION_QUEUE.md)和[摄取授权](docs/implementation/A15_INGESTION_AUTHORIZATION.md)。
+
 真实 PDF 默认放在本地 `paper/`，该目录不会被 Git 跟踪。说明见 [`paper/README.md`](paper/README.md)。
+
+### 工作空间浏览器流程
+
+API 配置 `SCHOLARRAG_AUTH_MODE=session` 后，首页自动进入工作空间登录；使用管理员签发的会话令牌，完成论文上传、范围选择、单轮/多轮问答、历史恢复、认证 SSE、引用 PDF 与报告下载，以及私有阅读状态、笔记、标签、收藏和集合。浏览器功能页切换保留草稿，切换工作空间会清理旧空间数据。
+
+实现与限制见[问答流程](docs/implementation/A18_WORKSPACE_BROWSER_RESEARCH.md)、[阅读与集合](docs/implementation/A19_WORKSPACE_BROWSER_LIBRARY.md)。已完成一次两页 PDF 与两轮问答的[真实供应商小规模验收](docs/implementation/A20_LIVE_ACCEPTANCE.md)，不等于生产验收或检索质量 Gold。
 
 ### 检查配置
 
@@ -334,11 +344,16 @@ docker compose build
 
 ## 文档
 
+- [优化实施记录与进度](docs/implementation/README.md)
+- [MinerU 4.x 与当前云端 API 兼容性](docs/implementation/A11_MINERU_4_COMPATIBILITY.md)
+- [Langfuse 接入与学习指南](docs/LANGFUSE.md)
+- [多用户演进与生产化实施方向](docs/PRODUCTION_ROADMAP.md)
 - [MinerU / PaddleOCR 对比协议](docs/PARSER_BENCHMARK.md)
 - [人工 Gold 与 Judge 校准手册](docs/HUMAN_ACCEPTANCE.md)
 
 ## 隐私与安全
 
+- 多用户基础采用显式开启的 `SCHOLARRAG_AUTH_MODE=session`，已开放工作空间、授权论文读取、私有问答/SSE、[个人阅读状态](docs/implementation/A12_PRIVATE_READING_STATE.md)、[私有集合](docs/implementation/A13_PRIVATE_COLLECTIONS.md)与[统一上传队列](docs/implementation/A14_UNIFIED_INGESTION_QUEUE.md) API；旧个人接口关闭，旧上传/任务接口已移除；浏览器会话令牌登录与上传已接通，OIDC 待接入。试用与限制见[身份基础](docs/implementation/A07_IDENTITY_WORKSPACES.md)、[工作空间 API](docs/implementation/A08_WORKSPACE_API.md)和[私有问答](docs/implementation/A09_PRIVATE_WORKSPACE_RUNS.md)。默认 `local` 仅保留本地阅读与问答，新增上传需使用工作空间模式。
 - `.env`、真实 PDF、解析 artifacts、索引、评测集和浏览器记录已在 `.gitignore` 中排除；
 - 不要上传含有未授权内容、个人数据或商业秘密的论文；
 - 对外暴露 API 时请配置 `SCHOLARRAG_API_BEARER_TOKEN`、反向代理 TLS 和网络访问控制；
@@ -358,6 +373,7 @@ docker compose build
 ## 当前边界与路线
 
 - 当前定位是个人单用户、单摄取 worker；
+- 后续明确面向多用户与工作空间演进；功能、权限隔离、架构迁移、可靠任务和阶段验收见[实施方向文档](docs/PRODUCTION_ROADMAP.md)，其中规划尚未实施；
 - Parser Gold、QA reviewed set 和 Judge-human correlation 仍需真实人员完成；
 - PP-StructureV3 目前只用于对照，不在生产主链；
 - 视觉证据的消融评测（文本 vs 文本+图）需要积累真实 query runs 后产出结论；

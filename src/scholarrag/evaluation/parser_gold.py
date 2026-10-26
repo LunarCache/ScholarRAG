@@ -11,6 +11,15 @@ from scholarrag.config import Settings
 from scholarrag.storage.artifacts import ArtifactStore
 
 
+def annotation_schema_path(root: Path) -> Path:
+    custom = root / "schema.json"
+    return (
+        custom
+        if custom.is_file()
+        else Path(__file__).parent / "schemas/parser_annotation.schema.json"
+    )
+
+
 class ParserGoldError(RuntimeError):
     pass
 
@@ -26,7 +35,7 @@ class ParserGoldPreparer:
         manifest_path = manifest_path.resolve()
         paper_dir = paper_dir.resolve()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        schema_path = manifest_path.parent / "schema.json"
+        schema_path = annotation_schema_path(manifest_path.parent)
         if not schema_path.exists():
             raise ParserGoldError(f"Missing annotation schema: {schema_path}")
         schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -129,7 +138,7 @@ class ParserGoldPreparer:
         """Validate annotations and enforce independent-review semantics."""
         root = manifest_path.resolve().parent
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        schema = json.loads((root / "schema.json").read_text(encoding="utf-8"))
+        schema = json.loads(annotation_schema_path(root).read_text(encoding="utf-8"))
         validator = Draft202012Validator(schema, format_checker=FormatChecker())
         expected = [
             {

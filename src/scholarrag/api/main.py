@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-import anyio
-from fastapi import FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from scholarrag.api.schemas import (
     CollectionRequest,
@@ -19,7 +17,6 @@ from scholarrag.api.schemas import (
     EvaluationJobResponse,
     EvaluationRequest,
     HumanActorRequest,
-    JobStatus,
     JudgeRatingRequest,
     ParserAnnotationRequest,
     ParseReviewRequest,
@@ -32,41 +29,53 @@ from scholarrag.api.schemas import (
     QueryRequest,
     QueryResponse,
     QueryRunResponse,
-    UploadAccepted,
 )
 from scholarrag.api.security import LocalSecurityMiddleware
+from scholarrag.api.workspaces import workspace_router
+from scholarrag.authorization import (
+    AuthorizationGuard,
+    bind_authorization,
+    check_active_authorization,
+)
 from scholarrag.config import Settings, get_settings
+from scholarrag.domain.access import AccessDenied, IdentityConflict, Principal
 from scholarrag.evaluation.dashboard import QualityDashboard
 from scholarrag.evaluation.human_review import HumanReviewError, HumanReviewService
 from scholarrag.evaluation.jobs import EvaluationJobStore
 from scholarrag.evaluation.service import EvaluationCase, RagasEvaluator
 from scholarrag.ingestion.review import ParseReviewError, ParseReviewService
-from scholarrag.ingestion.service import IngestionService
+from scholarrag.ingestion.workspaces import WorkspaceIngestions
+from scholarrag.observability import Telemetry
 from scholarrag.rag.agent import AgenticRAGService
 from scholarrag.rag.runs import QueryRunStore, utc_now
 from scholarrag.rag.service import RAGService
+from scholarrag.rag.workspaces import WorkspaceQueries
 from scholarrag.retrieval.index import close_embedded_clients
-from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
-from scholarrag.storage.jobs import IngestionJobStore
+from scholarrag.storage.identity import IdentityStore
 from scholarrag.storage.library import PersonalLibraryStore, PersonalPaperState
-
-UPLOAD_FILE = File(...)
 
 
 class Runtime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.telemetry = Telemetry(settings)
         self.catalog = Catalog(settings)
+        self.identities = IdentityStore(settings)
+        self.workspace_ingestions = WorkspaceIngestions(settings, self.identities, self.telemetry)
         self.reviews = ParseReviewService(settings)
         self.query_runs = QueryRunStore(settings)
         self.query_tasks: dict[str, asyncio.Task[Any]] = {}
         self.evaluation_jobs = EvaluationJobStore(settings)
         self.evaluation_tasks: dict[str, asyncio.Task[Any]] = {}
-        self.jobs = IngestionJobStore(settings)
-        self.job_wakeup = asyncio.Event()
         self.library = PersonalLibraryStore(settings)
         self.tasks: set[asyncio.Task[Any]] = set()
+        self.workspace_queries = WorkspaceQueries(
+            settings,
+            self.identities,
+            lambda run_id, store: _run_query(self, run_id, store=store),
+            self.tasks,
+        )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -75,13 +84,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        await runtime.query_runs.recover_interrupted()
-        await runtime.query_runs.recover_interrupted_child_stages()
-        await runtime.evaluation_jobs.recover_interrupted()
-        runtime.jobs.recover_interrupted()
-        worker = asyncio.create_task(_ingestion_worker(runtime))
-        runtime.tasks.add(worker)
-        runtime.job_wakeup.set()
+        if settings.auth_mode == "local":
+            await runtime.query_runs.recover_interrupted()
+            await runtime.query_runs.recover_interrupted_child_stages()
+            await runtime.evaluation_jobs.recover_interrupted()
+        else:
+            await runtime.workspace_queries.recover()
+            await asyncio.to_thread(runtime.workspace_ingestions.recover)
+            runtime.tasks.add(asyncio.create_task(runtime.workspace_ingestions.worker()))
         try:
             yield
         finally:
@@ -90,12 +100,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if runtime.tasks:
                 await asyncio.gather(*runtime.tasks, return_exceptions=True)
             close_embedded_clients()
+            await asyncio.to_thread(runtime.telemetry.shutdown)
 
     app = FastAPI(title="ScholarRAG API", version="0.1.0", lifespan=lifespan)
-    app.add_middleware(LocalSecurityMiddleware, settings=settings)
+    app.state.runtime = runtime
+    app.add_middleware(LocalSecurityMiddleware, settings=settings, identities=runtime.identities)
+    app.include_router(
+        workspace_router(
+            settings,
+            runtime.identities,
+            runtime.catalog,
+            runtime.workspace_queries,
+            runtime.workspace_ingestions,
+        )
+    )
+
+    @app.exception_handler(AccessDenied)
+    async def access_denied(_: Request, exc: AccessDenied) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=403)
+
+    @app.exception_handler(IdentityConflict)
+    async def identity_conflict(_: Request, exc: IdentityConflict) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=409)
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=settings.api_cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -103,7 +133,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {"status": "ok", "auth_mode": settings.auth_mode}
 
     @app.get("/api/health/ready")
     async def readiness() -> dict[str, Any]:
@@ -232,59 +262,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 document["quality"] = manifest.get("quality")
                 document["routing"] = manifest.get("routing")
         return documents
-
-    @app.post("/api/documents", response_model=UploadAccepted, status_code=202)
-    async def upload_document(file: UploadFile = UPLOAD_FILE) -> UploadAccepted:
-        filename = _safe_filename(file.filename or "paper.pdf")
-        if Path(filename).suffix.lower() != ".pdf":
-            raise HTTPException(status_code=415, detail="Only PDF uploads are supported")
-        upload_dir = settings.data_dir / "uploads"
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        target = upload_dir / f"{uuid.uuid4().hex}-{filename}"
-        async with await anyio.open_file(target, "wb") as output:
-            while chunk := await file.read(1024 * 1024):
-                await output.write(chunk)
-        await file.close()
-        source_hash = await asyncio.to_thread(ArtifactStore.sha256, target)
-        job = runtime.jobs.enqueue(
-            filename=filename,
-            source_path=target,
-            idempotency_key=f"sha256:{source_hash}",
-        )
-        if Path(job.source_path) != target:
-            target.unlink(missing_ok=True)
-        runtime.job_wakeup.set()
-        return UploadAccepted(job_id=job.job_id)
-
-    @app.get("/api/jobs/{job_id}", response_model=JobStatus)
-    async def get_job(job_id: str) -> JobStatus:
-        job = runtime.jobs.get(job_id)
-        if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JobStatus.model_validate(job.model_dump())
-
-    @app.get("/api/jobs")
-    async def list_jobs(limit: int = 100) -> list[JobStatus]:
-        if not 1 <= limit <= 500:
-            raise HTTPException(status_code=422, detail="limit must be between 1 and 500")
-        return [JobStatus.model_validate(job.model_dump()) for job in runtime.jobs.list(limit)]
-
-    @app.get("/api/jobs/{job_id}/events")
-    async def get_job_events(job_id: str) -> list[dict[str, object]]:
-        if runtime.jobs.get(job_id) is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return runtime.jobs.events(job_id)
-
-    @app.post("/api/jobs/{job_id}/retry", response_model=JobStatus)
-    async def retry_job(job_id: str) -> JobStatus:
-        try:
-            job = runtime.jobs.retry(job_id)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail="Job not found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        runtime.job_wakeup.set()
-        return JobStatus.model_validate(job.model_dump())
 
     @app.get("/api/documents/{document_id}/pdf")
     async def document_pdf(document_id: str) -> FileResponse:
@@ -430,11 +407,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if request.agentic
             else RAGService(settings)
         )
-        answer = await service.answer(
-            request.question,
-            document_ids=request.document_ids,
-            top_k=request.top_k,
-        )
+        trace_id = uuid.uuid4().hex
+        with runtime.telemetry.trace(
+            "scholarrag.query.sync",
+            trace_id=trace_id,
+            session_id=request.conversation_id,
+            input={"question": request.question},
+        ) as observation:
+            answer = await service.answer(
+                request.question,
+                document_ids=request.document_ids,
+                top_k=request.top_k,
+                trace_id=trace_id,
+            )
+            observation.update(output=answer.answer)
         return QueryResponse.model_validate(answer.model_dump())
 
     @app.post("/api/query-runs", response_model=QueryRunResponse, status_code=202)
@@ -763,41 +749,105 @@ async def _run_evaluation(runtime: Runtime, job_id: str) -> None:
             await runtime.evaluation_jobs.fail(job_id, f"{type(exc).__name__}: {exc}"[:2000])
 
 
-async def _ingestion_worker(runtime: Runtime) -> None:
-    while True:
-        job = runtime.jobs.claim_next()
-        if job is None:
-            runtime.job_wakeup.clear()
-            try:
-                await asyncio.wait_for(runtime.job_wakeup.wait(), timeout=2.0)
-            except TimeoutError:
-                pass
-            continue
-        await _run_ingestion(runtime, job.job_id, Path(job.source_path))
-
-
-async def _run_ingestion(runtime: Runtime, job_id: str, path: Path) -> None:
-    job = runtime.jobs.get(job_id)
-    if job is None:
-        return
+async def _run_query(runtime: Runtime, run_id: str, *, store: QueryRunStore | None = None) -> None:
+    store = store or runtime.query_runs
     try:
-        document, _, _ = await IngestionService(runtime.settings).ingest(path)
-        runtime.jobs.complete(
-            job_id,
-            document_id=document.document_id,
-            parse_id=document.parse_id,
-        )
-    except Exception as exc:  # noqa: BLE001 - background jobs must persist terminal failure state
-        runtime.jobs.fail(job_id, f"{type(exc).__name__}: {exc}")
-        runtime.job_wakeup.set()
+        await _execute_query(runtime, run_id, store=store)
+    except AccessDenied:
+        current = store.get(run_id)
+        if current and current.status in {"queued", "running"}:
+            await store.finalize(
+                run_id,
+                status="failed",
+                completed_at=utc_now(),
+                error="Authorization unavailable",
+                event_type="run.failed",
+                stage_id="response.persist",
+                label="授权已失效",
+                event_status="failed",
+                summary="任务未执行：授权不可用",
+            )
 
 
-async def _run_query(runtime: Runtime, run_id: str) -> None:
-    run = runtime.query_runs.get(run_id)
+async def _execute_query(runtime: Runtime, run_id: str, *, store: QueryRunStore) -> None:
+    store = store or runtime.query_runs
+    run = store.get(run_id)
     if run is None:
         return
-    recorder = runtime.query_runs.recorder(run_id)
-    await runtime.query_runs.update(run_id, status="running", started_at=utc_now())
+    guard = None
+    try:
+        if run.workspace_id is not None:
+            context = runtime.identities.context_for(
+                Principal(run.owner_id, run.actor_session_id), run.workspace_id
+            )
+            runtime.workspace_queries.read(context, run_id)
+            guard = AuthorizationGuard(runtime.identities, context, tuple(run.document_ids))
+        elif runtime.settings.auth_mode == "session":
+            raise AccessDenied("Workspace ownership required")
+    except AccessDenied:
+        await store.finalize(
+            run_id,
+            status="failed",
+            completed_at=utc_now(),
+            error="Authorization unavailable",
+            event_type="run.failed",
+            stage_id="response.persist",
+            label="授权已失效",
+            event_status="failed",
+            summary="任务未执行：授权不可用",
+        )
+        return
+    with (
+        bind_authorization(guard),
+        runtime.telemetry.trace(
+            "scholarrag.query",
+            trace_id=run.trace_id,
+            session_id=run.conversation_id,
+            user_id=run.owner_id,
+            metadata={
+                "run_id": run_id,
+                "agentic": run.agentic,
+                "tool_mode": run.tool_mode,
+                "workspace_id": run.workspace_id,
+            },
+            input={"question": run.question},
+        ) as observation,
+    ):
+        parent_task = asyncio.current_task()
+
+        async def watch_authorization():
+            while True:
+                await asyncio.sleep(runtime.settings.authorization_poll_seconds)
+                try:
+                    guard.check()
+                except AccessDenied:
+                    parent_task.cancel()
+                    return
+
+        watcher = asyncio.create_task(watch_authorization()) if guard is not None else None
+        try:
+            await _run_query_inner(runtime, run_id, store)
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+        final = store.get(run_id)
+        if final:
+            observation.update(
+                output=final.answer.answer if final.answer else None,
+                level="ERROR"
+                if final.status == "failed"
+                else ("WARNING" if final.status == "cancelled" else "DEFAULT"),
+                status_message=final.status,
+            )
+
+
+async def _run_query_inner(runtime: Runtime, run_id: str, store: QueryRunStore) -> None:
+    run = store.get(run_id)
+    if run is None:
+        return
+    recorder = store.recorder(run_id)
+    await store.update(run_id, status="running", started_at=utc_now())
     await recorder.emit(
         event_type="run.started",
         stage_id="request",
@@ -806,9 +856,19 @@ async def _run_query(runtime: Runtime, run_id: str) -> None:
         summary="开始执行问答链路",
     )
     try:
+        check_active_authorization()
         contextual_question = run.question
         if run.parent_run_id:
-            parent = runtime.query_runs.get(run.parent_run_id)
+            parent = (
+                runtime.workspace_queries.read(
+                    runtime.identities.context_for(
+                        Principal(run.owner_id, run.actor_session_id), run.workspace_id
+                    ),
+                    run.parent_run_id,
+                )
+                if run.workspace_id is not None
+                else store.get(run.parent_run_id)
+            )
             if parent and parent.answer:
                 contextual_question = (
                     f"上轮问题：{parent.question}\n上轮回答：{parent.answer.answer[:4000]}\n\n"
@@ -835,7 +895,12 @@ async def _run_query(runtime: Runtime, run_id: str) -> None:
             events=recorder,
             trace_id=run.trace_id,
         )
-        await runtime.query_runs.finalize(
+        check_active_authorization()
+        if run.workspace_id is not None and any(
+            citation.document_id not in run.document_ids for citation in answer.citations
+        ):
+            raise AccessDenied("Answer contains out-of-scope citations")
+        await store.finalize(
             run_id,
             status="completed",
             completed_at=utc_now(),
@@ -852,20 +917,29 @@ async def _run_query(runtime: Runtime, run_id: str) -> None:
             trace={"trace_id": answer.trace_id},
         )
     except asyncio.CancelledError:
-        await runtime.query_runs.finalize(
+        revoked = False
+        try:
+            check_active_authorization()
+        except AccessDenied:
+            revoked = True
+        await store.finalize(
             run_id,
             status="cancelled",
             completed_at=utc_now(),
-            error="Cancelled by user",
+            error="Authorization revoked" if revoked else "Cancelled by user",
             event_type="run.cancelled",
             stage_id="response.persist",
             label="回答已取消",
             event_status="cancelled",
-            summary="用户取消了本次问答",
+            summary="授权失效，任务停止" if revoked else "本次问答已取消",
         )
     except Exception as exc:  # noqa: BLE001 - run artifact must record terminal failures
-        error = f"{type(exc).__name__}: {exc}"
-        await runtime.query_runs.finalize(
+        error = (
+            "Authorization unavailable"
+            if isinstance(exc, AccessDenied)
+            else ("Query execution failed" if run.workspace_id else f"{type(exc).__name__}: {exc}")
+        )
+        await store.finalize(
             run_id,
             status="failed",
             completed_at=utc_now(),
@@ -876,11 +950,6 @@ async def _run_query(runtime: Runtime, run_id: str) -> None:
             event_status="failed",
             summary="问答链路执行失败",
         )
-
-
-def _safe_filename(filename: str) -> str:
-    name = Path(filename).name
-    return re.sub(r"[^A-Za-z0-9._\-\u4e00-\u9fff]", "_", name)[:180]
 
 
 def _render_pdf_page(source: Path, page_number: int, target: Path) -> None:

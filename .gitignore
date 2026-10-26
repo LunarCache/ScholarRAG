@@ -105,6 +105,8 @@ qdrant_storage/
 
 # User-supplied papers are not redistributed
 *.pdf
+# Authored acceptance input, containing no user-supplied paper content.
+!docs/implementation/acceptance/A20_source.pdf
 paper/*
 !paper/README.md
 

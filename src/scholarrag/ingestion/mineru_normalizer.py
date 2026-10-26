@@ -47,10 +47,18 @@ class MinerUNormalizer:
         provider_model: str,
     ) -> CanonicalDocument:
         content_path = self._single(raw_dir, "*_content_list_v2.json")
-        layout_path = raw_dir / "layout.json"
+        asset_root = content_path.parent
+        layout_path = asset_root / "layout.json"
         content_pages: list[list[dict[str, Any]]] = json.loads(
             content_path.read_text(encoding="utf-8")
         )
+        if not isinstance(content_pages, list) or any(
+            not isinstance(page, list) or any(not isinstance(block, dict) for block in page)
+            for page in content_pages
+        ):
+            raise ValueError(
+                "Expected cloud Content List V2 page arrays; native MiddleJson is unsupported"
+            )
         layout = json.loads(layout_path.read_text(encoding="utf-8")) if layout_path.exists() else {}
         page_sizes = {
             int(page["page_idx"]): page.get("page_size", [None, None])
@@ -108,7 +116,7 @@ class MinerUNormalizer:
                     markdown=markdown,
                     html=html,
                     latex=latex,
-                    image_path=str(raw_dir / image_path) if image_path else None,
+                    image_path=str(asset_root / image_path) if image_path else None,
                     reading_order=order,
                     section_path=list(section_stack),
                     source=source,
@@ -159,7 +167,12 @@ class MinerUNormalizer:
 
     @staticmethod
     def _single(root: Path, pattern: str) -> Path:
-        matches = list(root.glob(pattern))
+        matches = list(root.rglob(pattern))
+        if not matches and list(root.rglob("middle_json.json")):
+            raise ValueError(
+                "MinerU native middle_json output is not the cloud content-list-v2 contract; "
+                "MinerU 4.x V1 results require a separate normalizer"
+            )
         if len(matches) != 1:
             raise ValueError(f"Expected one {pattern} in {root}, found {len(matches)}")
         return matches[0]

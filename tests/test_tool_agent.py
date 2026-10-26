@@ -121,7 +121,9 @@ async def test_tool_loop_executes_tools_and_extracts_citations(
     assert answer.retrieval_debug["retrieved_chunk_ids"] == ["chk_1"]
 
 
-async def test_tool_loop_respects_call_budget(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_tool_loop_respects_call_budget(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import scholarrag.rag.tool_agent as tool_agent_module
     from scholarrag.retrieval.service import RetrievalService
 

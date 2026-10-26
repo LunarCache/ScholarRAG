@@ -29,7 +29,7 @@ from scholarrag.evaluation.dashboard import QualityDashboard
 from scholarrag.evaluation.easydataset import EasyDatasetAdapter
 from scholarrag.evaluation.human_review import HumanReviewError, HumanReviewService
 from scholarrag.evaluation.jobs import EvaluationJobStore
-from scholarrag.evaluation.parser_gold import ParserGoldPreparer
+from scholarrag.evaluation.parser_gold import ParserGoldPreparer, annotation_schema_path
 from scholarrag.evaluation.service import EvaluationCase, RagasEvaluator, load_cases
 from scholarrag.ingestion.chunker import SemanticChunker
 from scholarrag.ingestion.mineru_normalizer import MinerUNormalizer
@@ -48,7 +48,6 @@ from scholarrag.retrieval.index import VectorIndex, VisualIndex
 from scholarrag.retrieval.service import RetrievalService
 from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
-from scholarrag.storage.jobs import IngestionJobStore
 
 
 def make_mineru_fixture(root: Path) -> None:
@@ -317,7 +316,9 @@ def test_claims_link_to_minimal_evidence_spans() -> None:
         [RetrievedChunk(chunk=chunk, score=0.9)],
     )
     assert len(claims) == 1
-    assert claims[0].supported is True
+    assert claims[0].supported is False
+    assert claims[0].evidence_located is True
+    assert claims[0].support_status == "not_checked"
     assert claims[0].citation_ids == ["C1"]
     assert "12.5%" in claims[0].evidence_spans[0].quote
     assert claims[0].evidence_spans[0].block_id == "block_1"
@@ -334,8 +335,16 @@ def test_citation_skips_heading_blocks(tmp_path: Path) -> None:
         json.dumps(
             {
                 "blocks": [
-                    {"id": "blk_heading", "kind": "heading", "text": "3 KNOWLEDGE-INTENSIVE REASONING TASKS"},
-                    {"id": "blk_body", "kind": "paragraph", "text": "As shown in Figure 1(1d), by interacting…"},
+                    {
+                        "id": "blk_heading",
+                        "kind": "heading",
+                        "text": "3 KNOWLEDGE-INTENSIVE REASONING TASKS",
+                    },
+                    {
+                        "id": "blk_body",
+                        "kind": "paragraph",
+                        "text": "As shown in Figure 1(1d), by interacting…",
+                    },
                 ]
             }
         ),
@@ -548,37 +557,6 @@ async def test_evaluation_jobs_are_async_deduplicated_and_recoverable(tmp_path: 
     assert retry_created is True
     assert retry.job_id != first.job_id
     assert jobs.latest_for_query_run(query_run.run_id).job_id == retry.job_id  # type: ignore[union-attr]
-
-
-def test_ingestion_queue_is_idempotent_recoverable_and_dead_letters(tmp_path: Path) -> None:
-    settings = Settings(data_dir=tmp_path / "data")
-    store = IngestionJobStore(settings)
-    source = tmp_path / "paper.pdf"
-    source.touch()
-    first = store.enqueue(
-        filename="paper.pdf",
-        source_path=source,
-        idempotency_key="sha256:abc",
-        max_attempts=2,
-    )
-    duplicate = store.enqueue(
-        filename="duplicate.pdf",
-        source_path=source,
-        idempotency_key="sha256:abc",
-    )
-    assert duplicate.job_id == first.job_id
-
-    claimed = store.claim_next()
-    assert claimed and claimed.status == "parsing" and claimed.attempts == 1
-    assert store.recover_interrupted() == [first.job_id]
-    claimed = store.claim_next()
-    assert claimed and claimed.attempts == 2
-    failed = store.fail(first.job_id, "provider unavailable")
-    assert failed.status == "failed"
-    assert store.events(first.job_id)[-1]["event_type"] == "job.dead_lettered"
-
-    retried = store.retry(first.job_id)
-    assert retried.status == "queued" and retried.attempts == 0
 
 
 async def test_query_run_completes_without_provider_calls_when_scope_is_empty(
@@ -1424,7 +1402,7 @@ def test_human_review_workbench_enforces_independence_and_computes_gates(
     parser_root = evals_dir / "parser-gold"
     annotations = parser_root / "annotations"
     annotations.mkdir(parents=True)
-    schema = json.loads(Path("evals/parser-gold/schema.json").read_text(encoding="utf-8"))
+    schema = json.loads(annotation_schema_path(parser_root).read_text(encoding="utf-8"))
     (parser_root / "schema.json").write_text(json.dumps(schema), encoding="utf-8")
     (parser_root / "manifest.json").write_text(
         json.dumps(

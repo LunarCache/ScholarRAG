@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import random
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 import httpx
 
+from scholarrag.authorization import check_active_authorization, current_guard
 from scholarrag.config import Settings
+from scholarrag.observability import Observation, observe, usage_details
 from scholarrag.storage.cache import ProviderCache
+
+_LIMITERS: WeakKeyDictionary = WeakKeyDictionary()
 
 
 class SiliconFlowError(RuntimeError):
@@ -26,10 +33,13 @@ class ProviderResponse:
 
 
 class ProviderStream:
-    def __init__(self, response: httpx.Response) -> None:
+    def __init__(self, response: httpx.Response, observation: Observation | None = None) -> None:
         self.response = response
         self.trace_id = response.headers.get("x-siliconcloud-trace-id")
         self.usage: dict[str, Any] = {}
+        self.observation = observation or Observation()
+        self.text = ""
+        self._completion_started = False
 
     async def chunks(self) -> AsyncIterator[dict[str, Any]]:
         async for line in self.response.aiter_lines():
@@ -39,8 +49,21 @@ class ProviderStream:
             if not data or data == "[DONE]":
                 continue
             payload = json.loads(data)
+            check_active_authorization()
             if isinstance(payload.get("usage"), dict):
                 self.usage = payload["usage"]
+            for choice in payload.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if not self._completion_started and (
+                    delta.get("content")
+                    or delta.get("reasoning_content")
+                    or delta.get("tool_calls")
+                ):
+                    self._completion_started = True
+                    self.observation.update(completion_start_time=datetime.now(UTC))
+                content = delta.get("content")
+                if self.observation.capture_content and isinstance(content, str):
+                    self.text = (self.text + content)[:6000]
             yield payload
 
 
@@ -52,6 +75,7 @@ class SiliconFlowClient:
         if settings.siliconflow_api_key is None:
             raise SiliconFlowError("SILICONFLOW_API_KEY is not configured")
         self.base_url = settings.siliconflow_base_url.rstrip("/")
+        self.settings = settings
         self.embedding_model = settings.unified_embedding_model
         self.multimodal_embedding_model = settings.multimodal_embedding_model
         self.embedding_dimensions = settings.embedding_dimensions
@@ -66,7 +90,13 @@ class SiliconFlowClient:
         self.max_retries = settings.provider_max_retries
         self.failure_threshold = settings.provider_circuit_failure_threshold
         self.circuit_cooldown = settings.provider_circuit_cooldown_seconds
-        self._semaphore = asyncio.Semaphore(settings.provider_max_concurrency)
+        self._limit = settings.provider_max_concurrency
+        self._queue_timeout = settings.provider_queue_timeout_seconds
+        self._limiter_key = (
+            self.base_url,
+            hashlib.sha256(settings.siliconflow_api_key.get_secret_value().encode()).hexdigest(),
+            self._limit,
+        )
         self.cache = ProviderCache(settings)
         self._owned_client = client is None
         self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(180.0))
@@ -79,6 +109,25 @@ class SiliconFlowClient:
         if self._owned_client:
             await self.client.aclose()
 
+    @asynccontextmanager
+    async def _request_slot(self) -> AsyncIterator[None]:
+        # Share capacity across client instances; never share asyncio primitives across loops.
+        loop = asyncio.get_running_loop()
+        registry = _LIMITERS.setdefault(loop, WeakValueDictionary())
+        semaphore = registry.get(self._limiter_key)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self._limit)
+            registry[self._limiter_key] = semaphore
+        try:
+            await asyncio.wait_for(semaphore.acquire(), timeout=self._queue_timeout)
+        except TimeoutError as exc:
+            raise SiliconFlowError("SiliconFlow concurrency queue timed out") from exc
+        try:
+            check_active_authorization()
+            yield
+        finally:
+            semaphore.release()
+
     async def embeddings(
         self,
         texts: list[str],
@@ -86,6 +135,7 @@ class SiliconFlowClient:
         model: str | None = None,
         dimensions: int | None = None,
     ) -> ProviderResponse:
+        current_guard(self.settings)
         active_model = model or self.embedding_model
         active_dimensions = dimensions or self.embedding_dimensions
         return await self._cached_embeddings(
@@ -107,6 +157,7 @@ class SiliconFlowClient:
         *,
         dimensions: int | None = None,
     ) -> ProviderResponse:
+        current_guard(self.settings)
         active_dimensions = dimensions or self.embedding_dimensions
         payload = {
             "model": self.multimodal_embedding_model,
@@ -154,9 +205,7 @@ class SiliconFlowClient:
         payload: dict[str, Any] = {
             "model": self.chat_model,
             "messages": messages,
-            "temperature": (
-                self.chat_temperature if temperature is None else temperature
-            ),
+            "temperature": (self.chat_temperature if temperature is None else temperature),
             "enable_thinking": self.chat_enable_thinking,
         }
         self._apply_sampling_params(payload, top_p=top_p, top_k=top_k, min_p=min_p)
@@ -180,12 +229,11 @@ class SiliconFlowClient:
         thinking_budget: int | None = None,
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[ProviderStream]:
+        current_guard(self.settings)
         payload = {
             "model": self.chat_model,
             "messages": messages,
-            "temperature": (
-                self.chat_temperature if temperature is None else temperature
-            ),
+            "temperature": (self.chat_temperature if temperature is None else temperature),
             "enable_thinking": self.chat_enable_thinking,
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -195,18 +243,37 @@ class SiliconFlowClient:
             payload["thinking_budget"] = thinking_budget
         if tools:
             payload["tools"] = tools
-        async with self.client.stream(
-            "POST",
-            f"{self.base_url}/chat/completions",
-            headers=self.headers,
-            json=payload,
-        ) as response:
-            if response.is_error:
-                body = (await response.aread()).decode(errors="replace")
-                raise SiliconFlowError(
-                    f"SiliconFlow /chat/completions failed ({response.status_code}): {body[:500]}"
-                )
-            yield ProviderStream(response)
+        with observe(
+            "siliconflow.chat.stream",
+            as_type="generation",
+            model=self.chat_model,
+            input=messages,
+            model_parameters={"temperature": payload["temperature"]},
+            metadata={"provider": "siliconflow", "stream": True},
+        ) as observation:
+            async with (
+                self._request_slot(),
+                self.client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=payload,
+                ) as response,
+            ):
+                if response.is_error:
+                    body = (await response.aread()).decode(errors="replace")
+                    raise SiliconFlowError(
+                        f"SiliconFlow /chat/completions failed ({response.status_code}): {body[:500]}"
+                    )
+                stream = ProviderStream(response, observation)
+                try:
+                    yield stream
+                finally:
+                    observation.update(
+                        output=stream.text or None,
+                        usage_details=usage_details(stream.usage),
+                        metadata={"provider_trace_id": stream.trace_id},
+                    )
 
     def _apply_sampling_params(
         self,
@@ -228,12 +295,44 @@ class SiliconFlowClient:
         return ProviderResponse(response.json(), response.headers.get("x-siliconcloud-trace-id"))
 
     async def _post(self, path: str, payload: dict[str, Any]) -> ProviderResponse:
+        current_guard(self.settings)
+        kind = (
+            "generation"
+            if path == "/chat/completions"
+            else "embedding"
+            if path == "/embeddings"
+            else "span"
+        )
+        with observe(
+            f"siliconflow{path}",
+            as_type=kind,
+            **({"model": payload.get("model")} if kind != "span" else {}),
+            input=payload.get("messages") if kind == "generation" else None,
+            metadata={"provider": "siliconflow", "model": payload.get("model")},
+        ) as observation:
+            response = await self._post_with_retries(path, payload)
+            check_active_authorization()
+            fields: dict[str, Any] = {
+                "metadata": {"provider_trace_id": response.trace_id, "provider": "siliconflow"},
+            }
+            if kind in {"generation", "embedding"}:
+                fields["usage_details"] = usage_details(response.data.get("usage") or {})
+            if kind == "generation":
+                fields["output"] = [
+                    choice.get("message", {}).get("content")
+                    for choice in response.data.get("choices") or []
+                ]
+            observation.update(**fields)
+            return response
+
+    async def _post_with_retries(self, path: str, payload: dict[str, Any]) -> ProviderResponse:
         if time.monotonic() < type(self)._circuit_open_until:
             raise SiliconFlowError("SiliconFlow circuit is temporarily open after repeated errors")
         last_error: str | None = None
         for attempt in range(self.max_retries + 1):
+            check_active_authorization()
             try:
-                async with self._semaphore:
+                async with self._request_slot():
                     response = await self.client.post(
                         f"{self.base_url}{path}", headers=self.headers, json=payload
                     )

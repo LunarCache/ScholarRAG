@@ -5,7 +5,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
-RUN uv sync --frozen --no-dev --extra eval
+RUN uv sync --frozen --no-dev --extra eval --extra observability
 COPY docs ./docs
 COPY evals ./evals
 EXPOSE 8000

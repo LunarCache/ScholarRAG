@@ -6,6 +6,7 @@ import mimetypes
 from collections import defaultdict
 from pathlib import Path
 
+from scholarrag.authorization import authorized_documents, check_active_authorization
 from scholarrag.config import Settings
 from scholarrag.domain.models import CanonicalDocument, Chunk, RetrievedChunk
 from scholarrag.providers.siliconflow import SiliconFlowClient
@@ -29,12 +30,18 @@ class RetrievalService:
         top_k: int = 8,
         events: EventSink | None = None,
     ) -> tuple[list[RetrievedChunk], dict[str, object]]:
+        document_ids = authorized_documents(self.settings, document_ids)
         results, debug = await self._retrieve(
             query,
             document_ids=document_ids,
             top_k=top_k,
             events=events,
         )
+        check_active_authorization()
+        if document_ids is not None and any(
+            item.chunk.document_id not in document_ids for item in results
+        ):
+            raise PermissionError("Retrieval returned documents outside the query scope")
         return results, debug
 
     async def _retrieve(
@@ -45,7 +52,7 @@ class RetrievalService:
         top_k: int,
         events: EventSink | None,
     ) -> tuple[list[RetrievedChunk], dict[str, object]]:
-        provider = SiliconFlowClient(self.settings)
+        provider = None
         pipeline = PipelineTracer(events)
         try:
             async with pipeline.stage(
@@ -81,6 +88,7 @@ class RetrievalService:
                     "active_parse_ids": [],
                 }
 
+            provider = SiliconFlowClient(self.settings)
             async with pipeline.stage(
                 "query.embedding.vl",
                 "统一 VL Query Embedding",
@@ -372,7 +380,8 @@ class RetrievalService:
                 },
             }
         finally:
-            await provider.close()
+            if provider is not None:
+                await provider.close()
 
     def _build_vl_rerank_documents(
         self,

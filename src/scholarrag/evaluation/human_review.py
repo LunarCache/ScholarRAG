@@ -12,7 +12,7 @@ from typing import Any, Literal
 from jsonschema import Draft202012Validator, FormatChecker
 
 from scholarrag.config import Settings
-from scholarrag.evaluation.parser_gold import ParserGoldPreparer
+from scholarrag.evaluation.parser_gold import ParserGoldPreparer, annotation_schema_path
 from scholarrag.storage.catalog import Catalog
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]+$")
@@ -66,6 +66,7 @@ class HumanReviewService:
         summary = self.summary()
         sources = {
             "parser_manifest": self.parser_root / "manifest.json",
+            "parser_schema": annotation_schema_path(self.parser_root),
             "qa_dataset": self.qa_path,
             "judge_ratings": self.ratings_path,
             "audit_log": self.audit_path,
@@ -483,7 +484,7 @@ class HumanReviewService:
         )
 
     def _validate_parser(self, payload: dict[str, Any]) -> None:
-        schema_path = self.parser_root / "schema.json"
+        schema_path = annotation_schema_path(self.parser_root)
         if not schema_path.is_file():
             raise HumanReviewError("Parser-gold schema is missing")
         schema = self._read_json(schema_path)

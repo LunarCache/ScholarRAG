@@ -14,6 +14,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         env_prefix="SCHOLARRAG_",
         extra="ignore",
+        populate_by_name=True,
     )
 
     data_dir: Path = Path("data")
@@ -21,14 +22,44 @@ class Settings(BaseSettings):
     qdrant_url: str | None = None
     qdrant_api_key: SecretStr | None = None
     api_bearer_token: SecretStr | None = None
+    auth_mode: Literal["local", "session"] = "local"
+    api_cors_origins: list[str] = Field(
+        default_factory=lambda: ["http://localhost:3000", "http://127.0.0.1:3000"]
+    )
+    authorization_poll_seconds: float = Field(default=1.0, ge=0.1, le=30)
+    workspace_query_max_active: int = Field(default=16, ge=1, le=1000)
+    workspace_query_max_per_user: int = Field(default=4, ge=1, le=100)
+    workspace_ingestion_max_active: int = Field(default=64, ge=1, le=10000)
+    workspace_ingestion_max_per_user: int = Field(default=8, ge=1, le=1000)
     api_requests_per_minute: int = Field(default=240, ge=10, le=10_000)
+    upload_max_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    upload_max_pages: int = Field(default=500, ge=1)
+
+    # Optional telemetry. Credentials alone never enable export.
+    langfuse_enabled: bool = False
+    langfuse_capture_content: bool = False
+    langfuse_public_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGFUSE_PUBLIC_KEY", "SCHOLARRAG_LANGFUSE_PUBLIC_KEY"),
+    )
+    langfuse_secret_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGFUSE_SECRET_KEY", "SCHOLARRAG_LANGFUSE_SECRET_KEY"),
+    )
+    langfuse_base_url: str = Field(
+        default="https://cloud.langfuse.com",
+        validation_alias=AliasChoices("LANGFUSE_BASE_URL", "SCHOLARRAG_LANGFUSE_BASE_URL"),
+    )
+    langfuse_environment: str = "development"
 
     mineru_api_token: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices("MINERU_API_TOKEN", "SCHOLARRAG_MINERU_API_TOKEN"),
     )
     mineru_base_url: str = "https://mineru.net/api/v4"
-    mineru_model: str = "vlm"
+    mineru_model: Literal["vlm", "pipeline"] = "vlm"
+    mineru_language: str = Field(default="en", min_length=1, max_length=32)
+    mineru_is_ocr: bool = False
 
     paddleocr_access_token: SecretStr | None = Field(
         default=None,
@@ -71,6 +102,7 @@ class Settings(BaseSettings):
     chat_input_cny_per_million_tokens: float = Field(default=0, ge=0)
     chat_output_cny_per_million_tokens: float = Field(default=0, ge=0)
     provider_max_concurrency: int = Field(default=8, ge=1, le=64)
+    provider_queue_timeout_seconds: float = Field(default=30, gt=0, le=600)
     provider_max_retries: int = Field(default=3, ge=0, le=10)
     provider_circuit_failure_threshold: int = Field(default=5, ge=1, le=50)
     provider_circuit_cooldown_seconds: float = Field(default=30, ge=1, le=600)

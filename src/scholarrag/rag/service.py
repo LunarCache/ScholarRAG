@@ -53,6 +53,7 @@ def _block_kinds_by_parse(catalog: Catalog, parse_id: str) -> dict[str, str]:
     _CANONICAL_BLOCK_KINDS[parse_id] = kinds
     return kinds
 
+
 SYSTEM_PROMPT = """你是严谨的论文阅读助手。只能根据给出的证据回答。
 要求：
 1. 每个可验证的事实陈述后都标注一个或多个证据编号，例如 [C1] 或 [C1][C3]。
@@ -266,6 +267,7 @@ class RAGService:
                     "cited_contexts": cited_indexes,
                     "invalid_citation_indexes": invalid_indexes,
                     "claim_count": len(claims),
+                    "located_claim_count": sum(claim.evidence_located for claim in claims),
                     "supported_claim_count": sum(claim.supported for claim in claims),
                 },
                 status="warning" if invalid_indexes else "success",
@@ -402,7 +404,7 @@ class RAGService:
                     answer_end_char=end,
                     citation_ids=[f"C{index}" for index in indexes],
                     evidence_spans=spans,
-                    supported=bool(spans),
+                    support_status="not_checked",
                 )
             )
         return claims
@@ -426,18 +428,30 @@ class RAGService:
         best = max(sentences, key=overlap) if sentences else None
         start = best.start() if best else 0
         end = best.end() if best else min(len(item.chunk.text), 500)
+        while start < end and item.chunk.text[start].isspace():
+            start += 1
+        while end > start and item.chunk.text[end - 1].isspace():
+            end -= 1
         source_index = 0
-        if item.chunk.sources and len(item.chunk.sources) == len(item.chunk.block_ids):
-            prefix = item.chunk.text[:start]
-            source_index = min(prefix.count("\n\n"), len(item.chunk.sources) - 1)
+        exact = len(item.chunk.sources) == len(item.chunk.block_ids) == 1
+        for offset in item.chunk.metadata.get("block_offsets", []):
+            if offset["start"] <= start and end <= offset["end"]:
+                try:
+                    source_index = item.chunk.block_ids.index(offset["block_id"])
+                    exact = source_index < len(item.chunk.sources)
+                except ValueError:
+                    exact = False
+                break
         source = item.chunk.sources[source_index]
         return EvidenceSpan(
             citation_id=f"C{index}",
             chunk_id=item.chunk.id,
-            block_id=(item.chunk.block_ids[source_index] if item.chunk.block_ids else None),
+            block_id=(item.chunk.block_ids[source_index] if exact else None),
             page_number=source.page_number,
-            bbox=source.bbox,
+            bbox=source.bbox if exact else None,
             quote=item.chunk.text[start:end].strip(),
             start_char=start,
             end_char=end,
+            parse_id=item.chunk.parse_id,
+            location_status="exact" if exact else "approximate",
         )
