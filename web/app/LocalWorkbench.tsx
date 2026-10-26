@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { AgentTraceCompact, EvidencePointer, QueryRun, RunFlow, TraceEvent } from "./RunFlow";
 import { ReviewWorkbench } from "./ReviewWorkbench";
+import { ThemeToggle } from "./ThemeToggle";
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
@@ -606,6 +607,7 @@ export default function Home() {
           <div><strong>ScholarRAG</strong><small>RESEARCH COCKPIT</small></div>
         </div>
         <div className="status"><span className={busy ? "pulse" : "dot"} />{status}</div>
+        <ThemeToggle />
         <a className="upload" href="/workspace">进入工作空间</a>
       </header>
 

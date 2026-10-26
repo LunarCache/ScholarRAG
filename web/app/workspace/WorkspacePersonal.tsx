@@ -18,8 +18,13 @@ export function WorkspacePersonal(props: Common) {
     }
   }, [props.papers, documentId]);
   return <section className={styles.panel} aria-label="个人阅读与集合">
-    <h2>我的阅读空间</h2>
-    <p className={styles.muted}>笔记、标签、收藏和集合仅自己可见。切换工作空间会清除本页未保存草稿。</p>
+    <div className={styles.panelHead}>
+      <div>
+        <p className={styles.eyebrow}>PRIVATE READING STATE & COLLECTIONS</p>
+        <h2>我的阅读空间</h2>
+      </div>
+      <span className={styles.muted}>笔记、标签、收藏和集合仅自己可见。切换工作空间会清除本页未保存草稿。</span>
+    </div>
     <div className={styles.researchColumns}>
       <div>
         <label htmlFor="personal-document">编辑论文阅读记录</label>
@@ -29,7 +34,7 @@ export function WorkspacePersonal(props: Common) {
           {!props.papers.length && <option value="">暂无可访问论文</option>}
           {props.papers.map((paper) => <option key={paper.document_id} value={paper.document_id}>{paper.title || paper.source_filename}</option>)}
         </select>
-        {switchTo && <p role="alert">有未保存草稿。<button onClick={() => { setDocumentId(switchTo); setSwitchTo(null); setDirty(false); }}>放弃草稿并切换论文</button><button onClick={() => setSwitchTo(null)}>继续编辑</button></p>}
+        {switchTo && <p role="alert" className={styles.error}>有未保存草稿。<button onClick={() => { setDocumentId(switchTo); setSwitchTo(null); setDirty(false); }}>放弃草稿并切换论文</button><button onClick={() => setSwitchTo(null)}>继续编辑</button></p>}
         {current && <ReadingEditor key={current.document_id} {...props} documentId={current.document_id} onDirty={setDirty} />}
       </div>
       <CollectionEditor {...props} />
@@ -66,6 +71,7 @@ function ReadingEditor({ client, workspace, documentId, onError, onDirty }: Comm
     const controller = new AbortController(); scope.current = controller;
     void reload(controller.signal);
     return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, workspace.workspace_id, documentId]);
 
   async function save(event: FormEvent) {
@@ -94,16 +100,31 @@ function ReadingEditor({ client, workspace, documentId, onError, onDirty }: Comm
   function change(update: Partial<PaperState>) { setRecord((current) => current ? { ...current, ...update } : null); onDirty(true); setMessage(""); }
   return <form className={styles.editor} onSubmit={save}>
     {message && <p role="status" className={conflict ? styles.error : styles.notice}>{message}</p>}
-    {!record ? <p>{busy ? "加载阅读记录…" : "记录暂不可用。"}</p> : <>
-      <label htmlFor="reading-status">阅读状态</label><select id="reading-status" disabled={!writable || busy} value={record.reading_status} onChange={(event) => change({ reading_status: event.target.value as PaperState["reading_status"] })}><option value="unread">未读</option><option value="reading">阅读中</option><option value="finished">已读</option></select>
+    {!record ? <p className={styles.muted}>{busy ? "加载阅读记录…" : "记录暂不可用。"}</p> : <>
+      <div>
+        <label htmlFor="reading-status">阅读状态</label>
+        <select id="reading-status" disabled={!writable || busy} value={record.reading_status} onChange={(event) => change({ reading_status: event.target.value as PaperState["reading_status"] })}>
+          <option value="unread">未读</option>
+          <option value="reading">阅读中</option>
+          <option value="finished">已读</option>
+        </select>
+      </div>
       <label className={styles.checkLabel}><input type="checkbox" checked={record.favorite} disabled={!writable || busy} onChange={(event) => change({ favorite: event.target.checked })} />收藏这篇论文</label>
-      <label htmlFor="paper-tags">标签（逗号分隔）</label><input id="paper-tags" value={tags} maxLength={4224} disabled={!writable || busy} onChange={(event) => { setTags(event.target.value); onDirty(true); }} />
-      <label htmlFor="paper-note">私有笔记</label><textarea id="paper-note" value={record.note} maxLength={20000} rows={6} readOnly={!writable} disabled={busy} onChange={(event) => change({ note: event.target.value })} />
+      <div>
+        <label htmlFor="paper-tags">标签（逗号分隔）</label>
+        <input id="paper-tags" placeholder="例如：RAG, Agent, Multimodal, Baseline" value={tags} maxLength={4224} disabled={!writable || busy} onChange={(event) => { setTags(event.target.value); onDirty(true); }} />
+      </div>
+      <div>
+        <label htmlFor="paper-note">私有笔记</label>
+        <textarea id="paper-note" placeholder="记录论文的核心假设、实验设置、公式推导或局限性…" value={record.note} maxLength={20000} rows={6} readOnly={!writable} disabled={busy} onChange={(event) => change({ note: event.target.value })} />
+      </div>
       <small className={styles.muted}>修订 {record.revision} · {record.note.length}/20000 字</small>
-      {writable ? <button className={styles.primary} disabled={busy || conflict}>保存阅读记录</button> : <p className={styles.muted}>当前角色不能编辑，可以清空自己先前保存的记录。</p>}
-      <button type="button" disabled={busy} onClick={() => { const signal = scope.current?.signal; if (signal) void reload(signal); }}>放弃草稿并加载最新记录</button>
-      {record.revision > 0 && <button type="button" disabled={busy || conflict} onClick={() => setDeleting(true)}>清空我的阅读记录</button>}
-      {deleting && <div role="alert"><p>只清空自己的笔记、标签、收藏与阅读状态。</p><button type="button" disabled={busy} onClick={() => void remove()}>确认清空记录</button><button type="button" onClick={() => setDeleting(false)}>保留记录</button></div>}
+      <div className={styles.editorFooter}>
+        {writable ? <button className={styles.primary} disabled={busy || conflict}>保存阅读记录</button> : <p className={styles.muted}>当前角色不能编辑，可以清空自己先前保存的记录。</p>}
+        <button type="button" disabled={busy} onClick={() => { const signal = scope.current?.signal; if (signal) void reload(signal); }}>放弃草稿并加载最新记录</button>
+        {record.revision > 0 && <button type="button" className={styles.dangerBtn} disabled={busy || conflict} onClick={() => setDeleting(true)}>清空我的阅读记录</button>}
+      </div>
+      {deleting && <div role="alert" className={styles.error}><p>只清空自己的笔记、标签、收藏与阅读状态。</p><div><button type="button" className={styles.dangerBtn} disabled={busy} onClick={() => void remove()}>确认清空记录</button><button type="button" onClick={() => setDeleting(false)}>保留记录</button></div></div>}
     </>}
   </form>;
 }
@@ -136,6 +157,7 @@ function CollectionEditor({ client, workspace, papers, onError, activeQuery, onU
     const controller = new AbortController(); scope.current = controller;
     void reload(controller.signal).catch((reason) => { if (!controller.signal.aborted) fail(reason); });
     return () => controller.abort();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, workspace.workspace_id]);
 
   function edit(item: PaperCollection | null) {
@@ -166,26 +188,41 @@ function CollectionEditor({ client, workspace, papers, onError, activeQuery, onU
   }
   const invalidScope = documents.some((id) => !papers.some((paper) => paper.document_id === id));
   return <div>
-    <div className={styles.panelHead}><h3>我的论文集合</h3><button disabled={busy || dirty || !writable} onClick={() => edit(null)}>新建集合</button></div>
+    <div className={styles.panelHead}>
+      <h3>我的论文集合</h3>
+      <button disabled={busy || dirty || !writable} onClick={() => edit(null)}>新建集合</button>
+    </div>
     {message && <p role="status" className={conflict ? styles.error : styles.notice}>{message}</p>}
-    <ul className={styles.collectionList}>{collections.map((item) => <li key={item.collection_id}><span>{item.name} · {item.document_ids.length} 篇{item.unavailable_document_count > 0 && ` · ${item.unavailable_document_count} 篇已不可访问`}</span><button disabled={busy || dirty} onClick={() => edit(item)}>打开集合</button><button disabled={busy || activeQuery || !item.document_ids.length} onClick={() => onUseCollection(item.document_ids)}>基于集合提问</button></li>)}</ul>
+    <ul className={styles.collectionList}>{collections.map((item) => <li key={item.collection_id}>
+      <span>{item.name} · {item.document_ids.length} 篇{item.unavailable_document_count > 0 && ` · ${item.unavailable_document_count} 篇已不可访问`}</span>
+      <button disabled={busy || dirty} onClick={() => edit(item)}>打开集合</button>
+      <button className={styles.primary} disabled={busy || activeQuery || !item.document_ids.length} onClick={() => onUseCollection(item.document_ids)}>基于集合提问</button>
+    </li>)}</ul>
     {!collections.length && <p className={styles.muted}>暂无私人集合。</p>}
     {!writable && <p className={styles.muted}>当前角色可查看或删除自己的已有集合，不能创建或修改。</p>}
     <form className={styles.editor} onSubmit={save}>
-      <label htmlFor="collection-name">{editing ? "集合名称" : "新集合名称"}</label><input id="collection-name" maxLength={120} value={name} disabled={!writable || busy} onChange={(event) => { setName(event.target.value); setDirty(true); }} />
-      <fieldset className={styles.scope}><legend>集合中的论文</legend>{papers.map((paper) => <label key={paper.document_id}><input type="checkbox" checked={documents.includes(paper.document_id)} disabled={!writable || busy} onChange={(event) => { setDocuments((items) => event.target.checked ? [...items, paper.document_id] : items.filter((id) => id !== paper.document_id)); setDirty(true); }} />{paper.title || paper.source_filename}</label>)}</fieldset>
+      <div>
+        <label htmlFor="collection-name">{editing ? "集合名称" : "新集合名称"}</label>
+        <input id="collection-name" placeholder="例如：2026 多模态检索综述" maxLength={120} value={name} disabled={!writable || busy} onChange={(event) => { setName(event.target.value); setDirty(true); }} />
+      </div>
+      <fieldset className={styles.scope}>
+        <legend>集合中的论文</legend>
+        {papers.map((paper) => <label key={paper.document_id}><input type="checkbox" checked={documents.includes(paper.document_id)} disabled={!writable || busy} onChange={(event) => { setDocuments((items) => event.target.checked ? [...items, paper.document_id] : items.filter((id) => id !== paper.document_id)); setDirty(true); }} />{paper.title || paper.source_filename}</label>)}
+      </fieldset>
       {Boolean(editing?.unavailable_document_count) && <label className={styles.checkLabel}><input type="checkbox" checked={dropUnavailable} disabled={!writable || busy} onChange={(event) => setDropUnavailable(event.target.checked)} />确认保存时移除 {editing?.unavailable_document_count} 个已不可访问的论文引用</label>}
-      {invalidScope && <p role="alert">论文权限已变化，请重新加载集合后编辑。</p>}
-      {writable && <button className={styles.primary} disabled={busy || conflict || !name.trim() || invalidScope || Boolean(editing?.unavailable_document_count && !dropUnavailable)}>保存集合</button>}
-      <button type="button" disabled={busy} onClick={async () => {
-        const signal = scope.current?.signal; if (!signal || signal.aborted) return;
-        setBusy(true);
-        try { const items = await reload(signal); if (!signal.aborted) edit(items.find((item) => item.collection_id === editing?.collection_id) ?? null); }
-        catch (reason) { if (!signal.aborted) fail(reason); }
-        finally { if (!signal.aborted) setBusy(false); }
-      }}>放弃修改并刷新集合</button>
-      {editing && <button type="button" disabled={busy || dirty || conflict} onClick={() => setDeleteId(editing.collection_id)}>删除当前集合</button>}
-      {deleteId && <div role="alert"><p>删除集合不会删除论文或笔记。</p><button type="button" disabled={busy} onClick={() => void remove(deleteId)}>确认删除集合</button><button type="button" onClick={() => setDeleteId(null)}>保留集合</button></div>}
+      {invalidScope && <p role="alert" className={styles.error}>论文权限已变化，请重新加载集合后编辑。</p>}
+      <div className={styles.editorFooter}>
+        {writable && <button className={styles.primary} disabled={busy || conflict || !name.trim() || invalidScope || Boolean(editing?.unavailable_document_count && !dropUnavailable)}>保存集合</button>}
+        <button type="button" disabled={busy} onClick={async () => {
+          const signal = scope.current?.signal; if (!signal || signal.aborted) return;
+          setBusy(true);
+          try { const items = await reload(signal); if (!signal.aborted) edit(items.find((item) => item.collection_id === editing?.collection_id) ?? null); }
+          catch (reason) { if (!signal.aborted) fail(reason); }
+          finally { if (!signal.aborted) setBusy(false); }
+        }}>放弃修改并刷新集合</button>
+        {editing && <button type="button" className={styles.dangerBtn} disabled={busy || dirty || conflict} onClick={() => setDeleteId(editing.collection_id)}>删除当前集合</button>}
+      </div>
+      {deleteId && <div role="alert" className={styles.error}><p>删除集合不会删除论文或笔记。</p><div><button type="button" className={styles.dangerBtn} disabled={busy} onClick={() => void remove(deleteId)}>确认删除集合</button><button type="button" onClick={() => setDeleteId(null)}>保留集合</button></div></div>}
     </form>
   </div>;
 }

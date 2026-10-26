@@ -2,7 +2,9 @@
 
 import { FormEvent, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { RunEvent, WorkspaceApi, WorkspaceApiError, WorkspacePaper, WorkspaceRun, workspaceError } from "../../lib/workspace-api";
 import styles from "./workspace.module.css";
 
@@ -68,6 +70,7 @@ export function WorkspaceChat({ client, workspaceId, papers, onError, onOpenPdf,
     if (runRef.current && !terminal(runRef.current)) { setError("请先停止当前问答，再使用集合切换范围。"); return; }
     setSelected(selectionRequest.ids.filter((id) => papers.some((paper) => paper.document_id === id)));
     activeView.current += 1; setRun(null); setConversation([]); setEvents([]); setStreamed(""); setReport(null); setError(""); setConnection("");
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectionRequest]);
 
   useEffect(() => {
@@ -188,39 +191,107 @@ export function WorkspaceChat({ client, workspaceId, papers, onError, onOpenPdf,
   }
 
   return <section className={styles.panel} aria-label="工作空间问答">
-    <div className={styles.panelHead}><h2>论文问答</h2><button disabled={busy || Boolean(run && !terminal(run))} onClick={() => { activeView.current += 1; setRun(null); setEvents([]); setStreamed(""); setConversation([]); setReport(null); setError(""); setConnection(""); }}>新建会话</button></div>
+    <div className={styles.panelHead}>
+      <div>
+        <p className={styles.eyebrow}>RESEARCH COPILOT & TRACEABLE QA</p>
+        <h2>论文问答</h2>
+      </div>
+      <button disabled={busy || Boolean(run && !terminal(run))} onClick={() => { activeView.current += 1; setRun(null); setEvents([]); setStreamed(""); setConversation([]); setReport(null); setError(""); setConnection(""); }}>新建会话</button>
+    </div>
     {error && <p role="alert" className={styles.error}>{error}</p>}
     <div className={styles.researchColumns}>
       <div>
-        <fieldset className={styles.scope}><legend>检索范围（{selected.length} 篇）</legend>
+        <fieldset className={styles.scope}>
+          <legend>检索范围（{selected.length} 篇）</legend>
           <button type="button" disabled={busy || Boolean(run && !terminal(run))} onClick={() => setSelected(papers.map((paper) => paper.document_id))}>全选</button>
           <button type="button" disabled={busy || Boolean(run && !terminal(run))} onClick={() => setSelected([])}>清空</button>
           {papers.map((paper) => <label key={paper.document_id}><input type="checkbox" checked={selected.includes(paper.document_id)} disabled={busy || Boolean(run && !terminal(run))} onChange={(event) => setSelected((items) => event.target.checked ? [...items, paper.document_id] : items.filter((id) => id !== paper.document_id))} />{paper.title || paper.source_filename}</label>)}
         </fieldset>
+
         <form onSubmit={ask} className={styles.editor}>
           <label htmlFor="research-question">研究问题</label>
-          <textarea id="research-question" disabled={busy} value={question} maxLength={8000} rows={3} onChange={(event) => setQuestion(event.target.value)} placeholder="请基于所选论文回答，并给出原文引用。" />
-          <label htmlFor="answer-mode">回答方式</label><select id="answer-mode" disabled={busy || Boolean(run && !terminal(run))} value={mode} onChange={(event) => setMode(event.target.value)}><option value="rag">直接检索问答</option><option value="tool">工具 Agent</option><option value="multi">多步规划</option></select>
-          <button className={styles.primary} disabled={busy || !selected.length || !question.trim() || Boolean(run && !terminal(run))}>发送问题</button>
-          {!selected.length && <small>请选择至少一篇论文。</small>}
-          {run && terminal(run) && !sameScope(run.document_ids, selected) && <small>范围变化后会创建新会话。</small>}
+          <textarea
+            id="research-question"
+            disabled={busy}
+            value={question}
+            maxLength={8000}
+            rows={3}
+            onChange={(event) => setQuestion(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder="请基于所选论文回答，并给出原文引用（支持公式、实验对比与跨论文综合分析）…"
+          />
+          <div className={styles.editorFooter}>
+            <div className={styles.modeSelectGroup}>
+              <label htmlFor="answer-mode">回答方式</label>
+              <select id="answer-mode" disabled={busy || Boolean(run && !terminal(run))} value={mode} onChange={(event) => setMode(event.target.value)}>
+                <option value="rag">直接检索问答</option>
+                <option value="tool">工具 Agent</option>
+                <option value="multi">多步规划</option>
+              </select>
+            </div>
+            <button className={styles.primary} disabled={busy || !selected.length || !question.trim() || Boolean(run && !terminal(run))}>发送问题</button>
+          </div>
+          {!selected.length && <small className={styles.muted}>请选择至少一篇论文。</small>}
+          {run && terminal(run) && !sameScope(run.document_ids, selected) && <small className={styles.muted}>范围变化后会创建新会话。</small>}
         </form>
-        {conversation.filter((item) => item.run_id !== run?.run_id).map((item) => <details key={item.run_id}><summary>{item.question}</summary><ReactMarkdown remarkPlugins={[remarkGfm]} components={{ img: () => null }}>{item.answer?.answer ?? labels[item.status]}</ReactMarkdown></details>)}
+
+        {conversation.filter((item) => item.run_id !== run?.run_id).map((item) => <details key={item.run_id} className={styles.turnHistoryDetails}>
+          <summary>{item.question}</summary>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ img: () => null }}>{item.answer?.answer ?? labels[item.status]}</ReactMarkdown>
+        </details>)}
+
         {run && <article className={styles.answer}>
-          <div className={styles.panelHead}><h3>{run.question}</h3><span className={styles.badge}>{labels[run.status]}</span></div>
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ img: () => null }}>{run.answer?.answer || streamed || "正在检索与生成…"}</ReactMarkdown>
-          {run.error && <p role="alert">{run.status === "cancelled" ? "本次问答已取消。" : "本次问答未完成，请检查权限或稍后重试。"}</p>}
-          <details><summary>证据支持状态（{run.answer?.claims.length ?? 0} 项）</summary>{(run.answer?.claims ?? []).map((claim) => <p key={claim.claim_id} className={styles.muted}>{claim.text} · {claim.support_status === "supported" ? "已验证支持" : claim.support_status === "contradicted" ? "与原文矛盾" : claim.support_status === "insufficient" ? "支持证据不足" : claim.evidence_located ? "已定位原文，语义支持未验证" : "尚未定位证据"}</p>)}</details>
-          <ul className={styles.citations}>{run.answer?.citations.map((citation) => <li key={citation.citation_id}><button onClick={() => onOpenPdf(citation.document_id, citation.page_number)}>{citation.citation_id} · 第 {citation.page_number} 页</button><blockquote>{citation.quote}</blockquote></li>)}</ul>
+          <div className={styles.panelHead}>
+            <h3>{run.question}</h3>
+            <span className={styles.badge} data-state={run.status}>{labels[run.status]}</span>
+          </div>
+          <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ img: () => null }}>{run.answer?.answer || streamed || "正在检索与生成…"}</ReactMarkdown>
+          {run.error && <p role="alert" className={styles.error}>{run.status === "cancelled" ? "本次问答已取消。" : "本次问答未完成，请检查权限或稍后重试。"}</p>}
+
+          <details>
+            <summary>证据支持状态（{run.answer?.claims.length ?? 0} 项）</summary>
+            <div className={styles.claimAuditList}>
+              {(run.answer?.claims ?? []).map((claim) => {
+                const statusLabel = claim.support_status === "supported" ? "已验证支持" : claim.support_status === "contradicted" ? "与原文矛盾" : claim.support_status === "insufficient" ? "支持证据不足" : claim.evidence_located ? "已定位原文，语义支持未验证" : "尚未定位证据";
+                const supportAttr = claim.support_status === "supported" ? "supported" : claim.support_status === "contradicted" ? "contradicted" : "located";
+                return <p key={claim.claim_id} className={styles.claimItem}>
+                  {claim.text} · <span className={styles.claimStatusPill} data-support={supportAttr}>{statusLabel}</span>
+                </p>;
+              })}
+            </div>
+          </details>
+
+          <ul className={styles.citations}>{run.answer?.citations.map((citation) => <li key={citation.citation_id}>
+            <button onClick={() => onOpenPdf(citation.document_id, citation.page_number)}>{citation.citation_id} · 第 {citation.page_number} 页</button>
+            <blockquote>{citation.quote}</blockquote>
+          </li>)}</ul>
+
           <p role="status" className={styles.muted}>{connection}</p>
-          {!terminal(run) && <button disabled={busy} onClick={() => void cancelRun()}>停止回答</button>}
-          {!terminal(run) && <button onClick={() => setReconnect((value) => value + 1)}>重新连接</button>}
-          {run.answer && <button disabled={busy} onClick={() => void prepareReport()}>准备导出证据报告</button>}
-          {report && <a href={report} download={`scholarrag-${run.run_id}.md`}>下载证据报告.md</a>}
-          <details><summary>执行轨迹（最近 {events.length} 项）</summary><ol>{events.map((item) => <li key={item.seq}>{item.seq}. {item.label} · {item.status}</li>)}</ol></details>
+          <div>
+            {!terminal(run) && <button className={styles.dangerBtn} disabled={busy} onClick={() => void cancelRun()}>停止回答</button>}
+            {!terminal(run) && <button onClick={() => setReconnect((value) => value + 1)}>重新连接</button>}
+            {run.answer && <button disabled={busy} onClick={() => void prepareReport()}>准备导出证据报告</button>}
+            {report && <a href={report} download={`scholarrag-${run.run_id}.md`}>下载证据报告.md</a>}
+          </div>
+
+          <details>
+            <summary>执行轨迹（最近 {events.length} 项）</summary>
+            <ol>{events.map((item) => <li key={item.seq}>{item.seq}. {item.label} · {item.status}</li>)}</ol>
+          </details>
         </article>}
       </div>
-      <aside className={styles.history}><div className={styles.panelHead}><h3>我的问答历史</h3><button disabled={busy} onClick={() => void refreshHistory()}>刷新历史</button></div>
+
+      <aside className={styles.history}>
+        <div className={styles.panelHead}>
+          <h3>我的问答历史</h3>
+          <button disabled={busy} onClick={() => void refreshHistory()}>刷新历史</button>
+        </div>
         {!history.length && <p className={styles.muted}>尚无问答记录。</p>}
         {history.map((item) => <button key={item.run_id} disabled={busy} aria-current={run?.run_id === item.run_id ? "true" : undefined} onClick={() => void loadRun(item)}>{item.question}<small>{labels[item.status]} · {new Date(item.created_at).toLocaleString()}</small></button>)}
       </aside>
