@@ -7,7 +7,7 @@ import pytest
 from test_workspace_identity import add_document
 from test_workspace_identity import team as team  # noqa: PLC0414 - shared pytest fixture export
 
-from scholarrag.api.main import Runtime, create_app
+from scholarrag.api.main import create_app
 from scholarrag.api.schemas import QueryRequest
 from scholarrag.authorization import AuthorizationGuard, bind_authorization, current_guard
 from scholarrag.domain.access import AccessDenied
@@ -15,6 +15,8 @@ from scholarrag.domain.models import Answer
 from scholarrag.rag.runs import QueryRunStore
 from scholarrag.rag.service import RAGService
 from scholarrag.retrieval.service import RetrievalService
+from scholarrag.runtime import Runtime
+from scholarrag.worker import QueryWorker
 
 
 @pytest.fixture
@@ -27,8 +29,21 @@ async def application(team, monkeypatch):
         )
 
     monkeypatch.setattr(RAGService, "answer", answer)
-    app = create_app(team.settings.model_copy(update={"authorization_poll_seconds": 0.1}))
+    app = create_app(
+        team.settings.model_copy(
+            update={
+                "authorization_poll_seconds": 0.1,
+                "query_worker_poll_seconds": 0.02,
+                "query_worker_lease_seconds": 1,
+            }
+        )
+    )
+    worker = QueryWorker(Runtime(app.state.runtime.settings))
+    app.state.test_worker = worker
+    worker_task = asyncio.create_task(worker.run())
     yield app
+    worker_task.cancel()
+    await asyncio.gather(worker_task, return_exceptions=True)
     tasks = list(app.state.runtime.tasks)
     for task in tasks:
         task.cancel()
@@ -183,7 +198,7 @@ async def test_watcher_cancels_inflight_work_after_session_revocation(
         context, QueryRequest(question="wait", document_ids=[], agentic=False)
     )
     await asyncio.wait_for(started.wait(), timeout=1)
-    task = runtime.workspace_queries.active[run.run_id][1]
+    task = application.state.test_worker.active[run.run_id]
     team.store.revoke_session(context.session_id)
     await asyncio.wait_for(task, timeout=1)
     final = runtime.workspace_queries.store(team.workspace).get(run.run_id)
@@ -204,7 +219,11 @@ async def test_authorization_is_rechecked_before_answer_persistence(application,
     run = await runtime.workspace_queries.create(
         team.owner, QueryRequest(question="test", agentic=False)
     )
-    await runtime.workspace_queries.active[run.run_id][1]
+    for _ in range(100):
+        if run.run_id in application.state.test_worker.active:
+            break
+        await asyncio.sleep(0.001)
+    await application.state.test_worker.active[run.run_id]
     final = runtime.workspace_queries.store(team.workspace).get(run.run_id)
     assert final.status == "failed" and final.answer is None
     with pytest.raises(AccessDenied):
@@ -234,24 +253,18 @@ async def test_active_task_limits_and_queued_cancellation(application, team, mon
     assert len(team.store.owned_query_ids(team.owner)) == 1
 
 
-async def test_namespaced_recovery_preserves_legacy_runs(application, team):
-    runtime = application.state.runtime
-
-    async def pending(*args):
-        await asyncio.Event().wait()
-
-    runtime.workspace_queries.execute = pending
+async def test_api_restart_leaves_queued_workspace_runs_for_worker(team):
+    runtime = Runtime(team.settings)
     run = await runtime.workspace_queries.create(
-        team.owner, QueryRequest(question="interrupted", document_ids=[])
+        team.owner, QueryRequest(question="queued", document_ids=[], agentic=False)
     )
-    task = runtime.workspace_queries.active[run.run_id][1]
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    legacy = await runtime.query_runs.create(question="legacy", document_ids=[], top_k=8)
-    restarted = Runtime(team.settings)
-    await restarted.workspace_queries.recover()
-    assert restarted.workspace_queries.store(team.workspace).get(run.run_id).status == "failed"
-    assert restarted.query_runs.get(legacy.run_id).status == "queued"
+    restarted = create_app(team.settings)
+    async with restarted.router.lifespan_context(restarted):
+        assert (
+            restarted.state.runtime.workspace_queries.read(team.owner, run.run_id).status
+            == "queued"
+        )
+    assert runtime.workspace_queries.read(team.owner, run.run_id).status == "queued"
 
 
 async def test_session_retrieval_requires_guard_and_rejects_scope_expansion(team):

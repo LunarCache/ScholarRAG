@@ -38,12 +38,12 @@ class IdentityStore:
         self.path = settings.sqlite_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as connection:
-            # Explicit migration: discard obsolete single-user tasks and their events.
-            # Sources, parses and catalog records are intentionally untouched.
+            # Development schema: do not silently rewrite or discard old tasks.
             columns = {row[1] for row in connection.execute("PRAGMA table_info(ingestion_jobs)")}
-            if columns and "workspace_id" not in columns:
-                connection.execute("DROP TABLE IF EXISTS ingestion_job_events")
-                connection.execute("DROP TABLE ingestion_jobs")
+            if columns and "checkpoint" not in columns:
+                raise IdentityConflict(
+                    "Development ingestion schema changed; use a new data directory"
+                )
             # Execute individually so migration and version marker commit together.
             for statement in (
                 """CREATE TABLE IF NOT EXISTS auth_schema_versions (
@@ -123,6 +123,8 @@ class IdentityStore:
                     idempotency_hash TEXT NOT NULL,
                     status TEXT NOT NULL CHECK(status IN ('queued','parsing','ready','failed','canceled')),
                     error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    lease_token TEXT, lease_until REAL, worker_id TEXT,
+                    checkpoint TEXT NOT NULL DEFAULT '{}',
                     UNIQUE(workspace_id,owner_id,idempotency_hash))""",
                 """CREATE INDEX IF NOT EXISTS auth_ingestion_admission
                     ON ingestion_jobs(workspace_id,owner_id,status)""",
@@ -135,7 +137,7 @@ class IdentityStore:
             version = connection.execute(
                 "SELECT COALESCE(MAX(version),0) FROM auth_schema_versions"
             ).fetchone()[0]
-            if version > 4:
+            if version > 5:
                 raise IdentityConflict("Unsupported identity schema version")
             connection.execute(
                 "INSERT OR IGNORE INTO auth_schema_versions VALUES(1,?)", (int(time.time()),)
@@ -148,6 +150,9 @@ class IdentityStore:
             )
             connection.execute(
                 "INSERT OR IGNORE INTO auth_schema_versions VALUES(4,?)", (int(time.time()),)
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO auth_schema_versions VALUES(5,?)", (int(time.time()),)
             )
 
     @contextmanager
@@ -509,34 +514,49 @@ class IdentityStore:
         with self._transaction(write=False) as connection:
             self._conversation(connection, context, conversation_id)
 
-    def register_query_run(self, context: AccessContext, run) -> None:
-        with self._transaction() as connection:
-            self._authorize(connection, context, "query")
-            self._conversation(connection, context, run.conversation_id)
-            if (run.workspace_id, run.owner_id, run.actor_session_id) != (
+    def register_query_run(
+        self,
+        context: AccessContext,
+        run,
+        *,
+        connection: sqlite3.Connection,
+        max_active: int = 16,
+        max_per_user: int = 4,
+    ) -> None:
+        self._authorize(connection, context, "query")
+        self._conversation(connection, context, run.conversation_id)
+        if (run.workspace_id, run.owner_id, run.actor_session_id) != (
+            context.workspace_id,
+            context.user_id,
+            context.session_id,
+        ) or run.document_ids is None:
+            raise AccessDenied("Invalid query ownership")
+        allowed = set(self.active_document_ids(connection, context))
+        if not set(run.document_ids).issubset(allowed):
+            raise AccessDenied("Query documents unavailable")
+        counts = connection.execute(
+            """SELECT COUNT(*),COALESCE(SUM(q.owner_id=?),0)
+               FROM query_run_snapshots q JOIN auth_query_runs a ON a.run_id=q.run_id
+               WHERE q.namespace=? AND q.status IN ('queued','running')""",
+            (context.user_id, context.workspace_id),
+        ).fetchone()
+        if counts[0] >= max_active or counts[1] >= max_per_user:
+            from fastapi import HTTPException
+
+            raise HTTPException(status_code=429, detail="Too many active query runs")
+        connection.execute(
+            "INSERT INTO auth_query_runs VALUES(?,?,?,?,?,?,?)",
+            (
+                run.run_id,
                 context.workspace_id,
                 context.user_id,
+                run.conversation_id,
                 context.session_id,
-            ) or run.document_ids is None:
-                raise AccessDenied("Invalid query ownership")
-            allowed = set(self.active_document_ids(connection, context))
-            if not set(run.document_ids).issubset(allowed):
-                raise AccessDenied("Query documents unavailable")
-            connection.execute(
-                "INSERT INTO auth_query_runs VALUES(?,?,?,?,?,?,?)",
-                (
-                    run.run_id,
-                    context.workspace_id,
-                    context.user_id,
-                    run.conversation_id,
-                    context.session_id,
-                    json.dumps(run.document_ids),
-                    int(time.time()),
-                ),
-            )
-            self._audit(
-                connection, context.user_id, context.workspace_id, "query.created", run.run_id
-            )
+                json.dumps(run.document_ids),
+                int(time.time()),
+            ),
+        )
+        self._audit(connection, context.user_id, context.workspace_id, "query.created", run.run_id)
 
     def query_record(self, context: AccessContext, run_id: str) -> dict:
         with self._transaction(write=False) as connection:
@@ -559,8 +579,11 @@ class IdentityStore:
             return [
                 row[0]
                 for row in connection.execute(
-                    """SELECT run_id FROM auth_query_runs WHERE workspace_id=? AND owner_id=?
-                   AND (? IS NULL OR conversation_id=?) ORDER BY created_at DESC,run_id DESC LIMIT ?""",
+                    """SELECT a.run_id FROM auth_query_runs a
+                   JOIN query_run_snapshots q ON q.run_id=a.run_id AND q.namespace=a.workspace_id
+                   WHERE a.workspace_id=? AND a.owner_id=?
+                   AND (? IS NULL OR a.conversation_id=?)
+                   ORDER BY a.created_at DESC,a.run_id DESC LIMIT ?""",
                     (
                         context.workspace_id,
                         context.user_id,

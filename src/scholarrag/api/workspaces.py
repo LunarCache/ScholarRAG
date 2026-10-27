@@ -30,6 +30,11 @@ from scholarrag.domain.library import (
     WorkspacePaperState,
     WorkspaceStateRequest,
 )
+from scholarrag.evaluation.workspaces import (
+    WorkspaceEvaluationRequest,
+    WorkspaceEvaluations,
+    public_evaluation,
+)
 from scholarrag.ingestion.workspaces import WorkspaceIngestions
 from scholarrag.rag.workspaces import WorkspaceQueries, public_run
 from scholarrag.storage.artifacts import ArtifactStore
@@ -55,6 +60,7 @@ def workspace_router(
     catalog: Catalog,
     queries: WorkspaceQueries,
     ingestions: WorkspaceIngestions,
+    evaluations: WorkspaceEvaluations,
 ) -> APIRouter:
     library = WorkspaceLibrary(identities)
 
@@ -295,6 +301,77 @@ def workspace_router(
             headers={
                 "Content-Disposition": f'attachment; filename="scholarrag-{run_id}.md"',
             },
+        )
+
+    @router.post("/workspaces/{workspace_id}/evaluations", status_code=202)
+    async def create_evaluation(
+        workspace_id: str,
+        request: WorkspaceEvaluationRequest,
+        idempotency_key: str = Header(min_length=1, max_length=128, alias="Idempotency-Key"),
+        identity: Principal = identity_dependency,
+    ):
+        if not idempotency_key.strip():
+            raise HTTPException(status_code=422, detail="Idempotency-Key must not be blank")
+        return public_evaluation(
+            await evaluations.create(
+                identities.context_for(identity, workspace_id), request, idempotency_key
+            )
+        )
+
+    @router.get("/workspaces/{workspace_id}/evaluations/{job_id}")
+    def get_evaluation(workspace_id: str, job_id: str, identity: Principal = identity_dependency):
+        return public_evaluation(
+            evaluations.read(identities.context_for(identity, workspace_id), job_id)
+        )
+
+    @router.get("/workspaces/{workspace_id}/query-runs/{run_id}/evaluations/latest")
+    def latest_evaluation(
+        workspace_id: str, run_id: str, identity: Principal = identity_dependency
+    ):
+        return public_evaluation(
+            evaluations.latest(identities.context_for(identity, workspace_id), run_id)
+        )
+
+    @router.post("/workspaces/{workspace_id}/evaluations/{job_id}/cancel")
+    async def cancel_evaluation(
+        workspace_id: str, job_id: str, identity: Principal = identity_dependency
+    ):
+        return public_evaluation(
+            await evaluations.cancel(identities.context_for(identity, workspace_id), job_id)
+        )
+
+    @router.get("/workspaces/{workspace_id}/evaluations/{job_id}/event-log")
+    def evaluation_log(workspace_id: str, job_id: str, identity: Principal = identity_dependency):
+        context = identities.context_for(identity, workspace_id)
+        evaluations.read(context, job_id)
+        events = evaluations.store(workspace_id).list_events(job_id)
+        evaluations.read(context, job_id)
+        return [event.model_dump(mode="json") for event in events]
+
+    @router.get("/workspaces/{workspace_id}/evaluations/{job_id}/events")
+    async def evaluation_stream(
+        workspace_id: str,
+        job_id: str,
+        request: Request,
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        identity: Principal = identity_dependency,
+    ):
+        context = identities.context_for(identity, workspace_id)
+        evaluations.read(context, job_id)
+        try:
+            cursor = int(last_event_id or "0")
+            if cursor < 0:
+                raise ValueError("negative cursor")
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422, detail="Last-Event-ID must be a nonnegative integer"
+            ) from exc
+        return StreamingResponse(
+            evaluations.events(
+                context, job_id, after_seq=cursor, disconnected=request.is_disconnected
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
         )
 
     @router.get("/workspaces/{workspace_id}/conversations")

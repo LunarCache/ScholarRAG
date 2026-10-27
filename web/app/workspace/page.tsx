@@ -128,7 +128,7 @@ export default function WorkspacePage() {
         <div>
           <p className={styles.eyebrow}>TRACEABLE MULTIMODAL AGENTIC RAG</p>
           <h2>从原始 PDF 到可审计的学术证据链</h2>
-          <p className={styles.muted}>结合双解析引擎质量路由、Qwen3-VL 统一多模态检索与细粒度 Claim 语义支持度核验，打造零幻觉的科研工作空间。</p>
+          <p className={styles.muted}>结合双解析引擎质量路由、Qwen3-VL 统一多模态检索与细粒度引用定位，构建可核验的科研证据链。</p>
           <ul className={styles.featurePillList}>
             <li><span className={styles.featurePillIcon}>01</span><div><b>分屏对照精读与溯源</b><small>点击回答中的引用 [C#] 立即跳转原 PDF 页码，对照核实公式、实验表与上下文。</small></div></li>
             <li><span className={styles.featurePillIcon}>02</span><div><b>多模态 Agentic 自主检索</b><small>支持直接检索、多步规划与工具调用 Agent，完整记录并回放每一步检索轨迹。</small></div></li>

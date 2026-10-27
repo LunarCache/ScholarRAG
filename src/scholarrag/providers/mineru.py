@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import zipfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,6 +56,7 @@ class MinerUClient:
         *,
         data_id: str,
         page_ranges: str | None = None,
+        on_allocated: Callable[[MinerUJob], None] | None = None,
     ) -> MinerUJob:
         check_active_authorization()
         file_spec: dict[str, Any] = {
@@ -90,6 +91,9 @@ class MinerUClient:
             or not urls[0].strip()
         ):
             raise MinerUError("Cloud API v4 returned invalid batch_id or file_urls")
+        job = MinerUJob(batch_id=batch_id, trace_id=body.get("trace_id"))
+        if on_allocated is not None:
+            on_allocated(job)
         upload_url = urls[0]
         upload_response = await self._artifact_request(
             "PUT",
@@ -98,7 +102,7 @@ class MinerUClient:
             headers={"Content-Length": str(file_path.stat().st_size)},
         )
         upload_response.raise_for_status()
-        return MinerUJob(batch_id=batch_id, trace_id=body.get("trace_id"))
+        return job
 
     async def _artifact_request(self, method: str, url: str, **kwargs) -> httpx.Response:
         check_active_authorization()
@@ -153,7 +157,7 @@ class MinerUClient:
         response.raise_for_status()
         destination.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-            self._safe_extract(archive, destination)
+            await asyncio.to_thread(self._safe_extract, archive, destination)
         return destination
 
     @staticmethod
@@ -175,6 +179,7 @@ class MinerUClient:
     def _safe_extract(archive: zipfile.ZipFile, destination: Path) -> None:
         root = destination.resolve()
         for member in archive.infolist():
+            check_active_authorization()
             target = (destination / member.filename).resolve()
             if target != root and root not in target.parents:
                 raise MinerUError(f"Unsafe path in MinerU archive: {member.filename}")

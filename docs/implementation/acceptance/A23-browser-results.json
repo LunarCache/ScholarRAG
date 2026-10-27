@@ -1,0 +1,21 @@
+{
+  "synthetic_fixture": true,
+  "real_provider_calls": false,
+  "evaluation_jobs": {
+    "cancelled": 1,
+    "completed": 3
+  },
+  "evaluation_create_audits": 4,
+  "parent_run_status": "completed",
+  "parent_run_event_count": 2,
+  "retry_http_attempts": 2,
+  "retry_kept_same_idempotency_key": true,
+  "mobile_viewport_width": 390,
+  "mobile_document_width": 390,
+  "switch_workspace_cleared_answer_and_evaluation": true,
+  "refresh_and_relogin_restored_latest_evaluation": true,
+  "jobs_before_and_after_refresh": [
+    4,
+    4
+  ]
+}

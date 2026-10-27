@@ -1,14 +1,14 @@
-"""Private, durable ingestion admission and a single-process workspace worker.
-
-All HTTP ingestion uses this queue. Interrupted work is failed rather than
-replayed, because a remote submission may already be billed.
-"""
+"""Private ingestion admission and lease-fenced execution for independent workers."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
+import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,10 +16,17 @@ from pathlib import Path
 from scholarrag.authorization import bind_authorization
 from scholarrag.config import Settings
 from scholarrag.domain.access import AccessContext, AccessDenied, IdentityConflict, Principal
+from scholarrag.domain.models import CanonicalDocument, Chunk
+from scholarrag.ingestion.checkpoints import IngestionJournal, IngestionUncertain
 from scholarrag.ingestion.service import IngestionService
+from scholarrag.knowledge.service import MetadataExtractor
 from scholarrag.observability import Telemetry
+from scholarrag.rag.runs import LeaseLost
 from scholarrag.storage.artifacts import ArtifactStore
+from scholarrag.storage.catalog import Catalog
 from scholarrag.storage.identity import IdentityStore
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> str:
@@ -31,16 +38,20 @@ class IngestionGuard:
     identities: IdentityStore
     context: AccessContext
     job_id: str
+    lease_token: str | None
+    suspended: Callable[[], bool] = lambda: False
     # An upload grants no retrieval access, even while embedding new content.
     document_ids: tuple[str, ...] = ()
 
     def check(self) -> None:
         with self.identities.authorized_transaction(self.context, "upload") as connection:
             row = connection.execute(
-                """SELECT status,actor_session_id FROM ingestion_jobs
+                """SELECT * FROM ingestion_jobs
                    WHERE job_id=? AND workspace_id=? AND owner_id=?""",
                 (self.job_id, self.context.workspace_id, self.context.user_id),
             ).fetchone()
+            if row is not None:
+                WorkspaceIngestions.check_lease(row, self.lease_token, self.suspended())
             if (
                 row is None
                 or row["status"] != "parsing"
@@ -51,12 +62,18 @@ class IngestionGuard:
 
 class WorkspaceIngestions:
     def __init__(
-        self, settings: Settings, identities: IdentityStore, telemetry: Telemetry | None = None
+        self,
+        settings: Settings,
+        identities: IdentityStore,
+        telemetry: Telemetry | None = None,
+        *,
+        lease_token: str | None = None,
     ) -> None:
         self.settings = settings
         self.identities = identities
         self.telemetry = telemetry or Telemetry(settings)
-        self.wakeup = asyncio.Event()
+        self.lease_token = lease_token
+        self.suspended = False
 
     @staticmethod
     def _event(connection, job_id: str, status: str) -> None:
@@ -149,7 +166,6 @@ class WorkspaceIngestions:
                 connection, context.user_id, context.workspace_id, "ingestion.queued", job_id
             )
             result = self._public(connection, context, self._owned(connection, context, job_id))
-        self.wakeup.set()
         return result, True
 
     def read(self, context: AccessContext, job_id: str) -> dict:
@@ -187,37 +203,84 @@ class WorkspaceIngestions:
                 )
             return self._public(connection, context, self._owned(connection, context, job_id))
 
-    def claim_next(self) -> dict | None:
-        # Trusted worker inventory; tenant ownership is checked before execution.
+    @staticmethod
+    def check_lease(row, token: str | None, suspended: bool = False) -> None:
+        if (
+            suspended
+            or row is None
+            or not token
+            or row["lease_token"] != token
+            or (row["lease_until"] or 0) <= time.time()
+            or row["status"] != "parsing"
+        ):
+            raise LeaseLost("Ingestion lease unavailable")
+
+    def claim_next(self, worker_id: str = "manual") -> dict | None:
         with self.identities._transaction() as connection:
+            now = time.time()
             row = connection.execute(
-                "SELECT * FROM ingestion_jobs WHERE status='queued' ORDER BY created_at LIMIT 1"
+                """SELECT * FROM ingestion_jobs WHERE status='queued'
+                   OR (status='parsing' AND COALESCE(lease_until,0)<=?)
+                   ORDER BY created_at,job_id LIMIT 1""",
+                (now,),
             ).fetchone()
             if row is None:
                 return None
             connection.execute(
-                "UPDATE ingestion_jobs SET status='parsing',updated_at=? WHERE job_id=?",
-                (_now(), row["job_id"]),
+                """UPDATE ingestion_jobs SET status='parsing',updated_at=?,lease_token=?,
+                   lease_until=?,worker_id=? WHERE job_id=?""",
+                (
+                    _now(),
+                    uuid.uuid4().hex,
+                    now + self.settings.ingestion_worker_lease_seconds,
+                    worker_id,
+                    row["job_id"],
+                ),
             )
-            self._event(connection, row["job_id"], "parsing")
+            if row["status"] == "queued":
+                self._event(connection, row["job_id"], "parsing")
             return dict(
                 connection.execute(
-                    "SELECT * FROM ingestion_jobs WHERE job_id=?", (row["job_id"],)
+                    "SELECT * FROM ingestion_jobs WHERE job_id=?",
+                    (row["job_id"],),
                 ).fetchone()
             )
 
-    def recover(self) -> None:
-        # Single-process startup only. Remote effects are ambiguous after a crash.
+    def heartbeat(self, job_id: str) -> None:
         with self.identities._transaction() as connection:
-            rows = connection.execute(
-                "SELECT job_id FROM ingestion_jobs WHERE status='parsing'"
-            ).fetchall()
-            for row in rows:
-                self._finish(connection, row[0], "failed", "execution_interrupted")
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            self.check_lease(row, self.lease_token, self.suspended)
+            connection.execute(
+                "UPDATE ingestion_jobs SET lease_until=? WHERE job_id=?",
+                (time.time() + self.settings.ingestion_worker_lease_seconds, job_id),
+            )
+
+    def load_checkpoint(self, job_id: str) -> dict:
+        with self.identities._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            self.check_lease(row, self.lease_token, self.suspended)
+            return json.loads(row["checkpoint"])
+
+    def save_checkpoint(self, job_id: str, key: str, value: dict) -> None:
+        with self.identities._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            self.check_lease(row, self.lease_token, self.suspended)
+            checkpoint = json.loads(row["checkpoint"])
+            checkpoint[key] = value
+            connection.execute(
+                "UPDATE ingestion_jobs SET checkpoint=?,updated_at=? WHERE job_id=?",
+                (json.dumps(checkpoint), _now(), job_id),
+            )
 
     def _finish(self, connection, job_id: str, status: str, error_code: str | None) -> None:
         changed = connection.execute(
-            """UPDATE ingestion_jobs SET status=?,error_code=?,updated_at=?
+            """UPDATE ingestion_jobs SET status=?,error_code=?,updated_at=?,lease_token=NULL,lease_until=NULL
                WHERE job_id=? AND status IN ('queued','parsing')""",
             (status, error_code, _now(), job_id),
         ).rowcount
@@ -226,18 +289,50 @@ class WorkspaceIngestions:
 
     def fail(self, job_id: str, error_code: str) -> None:
         with self.identities._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM ingestion_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()
+            self.check_lease(row, self.lease_token, self.suspended)
             self._finish(connection, job_id, "failed", error_code)
 
-    def publish(self, context: AccessContext, job_id: str, document_id: str, parse_id: str) -> None:
-        # Grant + ready state + event + audit commit together after indexing succeeds.
+    def publish(
+        self,
+        context: AccessContext,
+        job_id: str,
+        document_id: str,
+        parse_id: str,
+        *,
+        lease_token: str | None = None,
+        publication: tuple[CanonicalDocument, list[Chunk], Path, Path] | None = None,
+    ) -> None:
+        # Catalog activation + grant + ready state + event + audit commit together.
+        catalog = Catalog(self.settings)
         with self.identities.authorized_transaction(context, "upload", write=True) as connection:
             row = self._owned(connection, context, job_id)
+            self.check_lease(row, lease_token or self.lease_token, self.suspended)
             if (
                 row["status"] != "parsing"
                 or row["actor_session_id"] != context.session_id
                 or row["document_id"] != document_id
             ):
                 raise AccessDenied("Ingestion no longer authorized")
+            if publication is not None:
+                document, chunks, source, parse_dir = publication
+                if document.document_id != document_id or document.parse_id != parse_id:
+                    raise IdentityConflict("Publication identity mismatch")
+                catalog.register(
+                    document,
+                    chunks,
+                    source_path=source,
+                    artifact_dir=parse_dir,
+                    external_connection=connection,
+                )
+                catalog.register_metadata(
+                    document_id,
+                    parse_id,
+                    MetadataExtractor.extract(document).model_dump(mode="json"),
+                    external_connection=connection,
+                )
             active = connection.execute(
                 """SELECT 1 FROM parses p JOIN documents d ON d.document_id=p.document_id
                    WHERE p.document_id=? AND p.parse_id=? AND p.active=1 AND d.source_sha256=?""",
@@ -263,21 +358,51 @@ class WorkspaceIngestions:
 
     async def _monitor(self, guard: IngestionGuard, task: asyncio.Task) -> None:
         while not task.done():
-            await asyncio.sleep(self.settings.authorization_poll_seconds)
+            await asyncio.sleep(
+                min(
+                    self.settings.authorization_poll_seconds,
+                    self.settings.ingestion_worker_lease_seconds / 3,
+                )
+            )
             try:
-                await asyncio.to_thread(guard.check)
-            except AccessDenied:
+                guard.check()
+                self.heartbeat(guard.job_id)
+            except (AccessDenied, LeaseLost):
+                task.cancel()
+                return
+            except Exception:
+                logger.exception("Ingestion heartbeat failed: %s", guard.job_id)
+                self.suspended = True
                 task.cancel()
                 return
 
     async def execute(self, job: dict) -> None:
+        if self.lease_token is None:
+            executor = WorkspaceIngestions(
+                self.settings, self.identities, self.telemetry, lease_token=job["lease_token"]
+            )
+            await executor.execute(job)
+            return
+        try:
+            await self._execute(job)
+        except LeaseLost:
+            # Cancellation, expiry or shutdown fenced this executor out.
+            return
+
+    async def _execute(self, job: dict) -> None:
         task = asyncio.current_task()
         monitor = None
         try:
             context = self.identities.context_for(
                 Principal(job["owner_id"], job["actor_session_id"]), job["workspace_id"]
             )
-            guard = IngestionGuard(self.identities, context, job["job_id"])
+            guard = IngestionGuard(
+                self.identities,
+                context,
+                job["job_id"],
+                self.lease_token,
+                suspended=lambda: self.suspended,
+            )
             with (
                 bind_authorization(guard),
                 self.telemetry.trace(
@@ -294,10 +419,27 @@ class WorkspaceIngestions:
                 ):
                     raise IdentityConflict("Staged PDF has changed")
                 guard.check()
-                service = IngestionService(self.settings, document_id=job["document_id"])
-                document, _, _ = await service.ingest(Path(job["source_path"]))
-                self.publish(context, job["job_id"], document.document_id, document.parse_id)
+                preserved, _ = await asyncio.to_thread(
+                    ArtifactStore(self.settings).preserve_source,
+                    Path(job["source_path"]),
+                    job["document_id"],
+                )
+                service = IngestionService(
+                    self.settings,
+                    document_id=job["document_id"],
+                    journal=IngestionJournal(self, job["job_id"]),
+                )
+                document, chunks, parse_dir = await service.ingest(Path(job["source_path"]))
+                self.publish(
+                    context,
+                    job["job_id"],
+                    document.document_id,
+                    document.parse_id,
+                    publication=(document, chunks, preserved, parse_dir),
+                )
                 Path(job["source_path"]).unlink(missing_ok=True)
+        except IngestionUncertain:
+            self.fail(job["job_id"], "external_outcome_unknown")
         except AccessDenied:
             self.fail(job["job_id"], "authorization_revoked")
         except asyncio.CancelledError:
@@ -309,23 +451,3 @@ class WorkspaceIngestions:
             if monitor is not None:
                 monitor.cancel()
                 await asyncio.gather(monitor, return_exceptions=True)
-
-    async def worker(self) -> None:
-        while True:
-            self.wakeup.clear()
-            job = await asyncio.to_thread(self.claim_next)
-            if job is None:
-                try:
-                    await asyncio.wait_for(self.wakeup.wait(), timeout=2)
-                except TimeoutError:
-                    pass
-                continue
-            # A revoked job cancels only its child; the queue worker keeps serving others.
-            child = asyncio.create_task(self.execute(job))
-            try:
-                await asyncio.shield(child)
-            except asyncio.CancelledError:
-                if asyncio.current_task().cancelling():
-                    child.cancel()
-                    await asyncio.gather(child, return_exceptions=True)
-                    raise

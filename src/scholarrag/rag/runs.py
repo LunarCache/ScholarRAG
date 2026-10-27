@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sqlite3
 import time
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager, contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
@@ -282,12 +282,34 @@ class PipelineTracer:
             )
 
 
-class QueryRunStore:
-    """Append-only event artifacts plus recoverable run snapshots."""
+class LeaseLost(RuntimeError):
+    """This executor can no longer mutate its run."""
 
-    def __init__(self, settings: Settings, *, workspace_id: str | None = None) -> None:
+
+class QueryCancellation(asyncio.CancelledError):
+    """Persistent cancellation observed at a write boundary."""
+
+
+class QueryRunStore:
+    """SQLite snapshots and ordered events committed in the same transaction.
+
+    Workspace executors must hold a live lease. Local developer-mode queries
+    use the same storage, but are still executed by the API process.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        workspace_id: str | None = None,
+        lease_token: str | None = None,
+    ) -> None:
         if workspace_id is not None and not re.fullmatch(r"ws_[0-9a-f]{32}", workspace_id):
             raise ValueError("Invalid workspace storage namespace")
+        self.settings = settings
+        self.namespace = workspace_id or ""
+        self.lease_token = lease_token
+        self.suspended = False
         root = (
             settings.data_dir
             if workspace_id is None
@@ -295,8 +317,75 @@ class QueryRunStore:
         )
         self.root = root / "query_runs"
         self.root.mkdir(parents=True, exist_ok=True)
-        self._locks: dict[str, asyncio.Lock] = {}
-        self._conditions: dict[str, asyncio.Condition] = {}
+        self.path = settings.sqlite_path
+        with self.transaction() as connection:
+            connection.execute("""CREATE TABLE IF NOT EXISTS query_run_snapshots (
+                run_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, owner_id TEXT,
+                status TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL,
+                lease_token TEXT, lease_until REAL, worker_id TEXT,
+                cancel_requested INTEGER NOT NULL DEFAULT 0, checkpoint TEXT)""")
+            connection.execute("""CREATE INDEX IF NOT EXISTS query_run_queue
+                ON query_run_snapshots(namespace,status,created_at)""")
+            connection.execute("""CREATE TABLE IF NOT EXISTS query_run_events (
+                run_id TEXT NOT NULL REFERENCES query_run_snapshots(run_id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(run_id,seq))""")
+
+    @contextmanager
+    def transaction(self, *, write: bool = True):
+        connection = sqlite3.connect(self.path, timeout=30)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA journal_mode=WAL")
+        try:
+            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+            yield connection
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def _row(self, connection, run_id: str):
+        row = connection.execute(
+            "SELECT * FROM query_run_snapshots WHERE run_id=? AND namespace=?",
+            (run_id, self.namespace),
+        ).fetchone()
+        if row is None:
+            raise KeyError(run_id)
+        return row
+
+    def _assert_writer(self, row, *, allow_cancel: bool = False) -> None:
+        if self.suspended or (
+            self.namespace
+            and (
+                not self.lease_token
+                or row["lease_token"] != self.lease_token
+                or (row["lease_until"] or 0) <= time.time()
+            )
+        ):
+            raise LeaseLost("Query lease unavailable")
+        if row["cancel_requested"] and not allow_cancel:
+            raise QueryCancellation()
+
+    @staticmethod
+    def _write(connection, run: QueryRun) -> None:
+        connection.execute(
+            "UPDATE query_run_snapshots SET status=?,payload=? WHERE run_id=?",
+            (run.status, run.model_dump_json(), run.run_id),
+        )
+
+    def _event(self, connection, run: QueryRun, **payload: Any) -> TraceEvent:
+        event = TraceEvent(
+            seq=run.event_count + 1, run_id=run.run_id, type=payload.pop("event_type"), **payload
+        )
+        connection.execute(
+            "INSERT INTO query_run_events VALUES(?,?,?)",
+            (run.run_id, event.seq, event.model_dump_json()),
+        )
+        run.event_count = event.seq
+        self._write(connection, run)
+        return event
 
     async def create(
         self,
@@ -311,10 +400,11 @@ class QueryRunStore:
         workspace_id: str | None = None,
         owner_id: str | None = None,
         actor_session_id: str | None = None,
+        register: Callable[[sqlite3.Connection, QueryRun], None] | None = None,
     ) -> QueryRun:
+        if (workspace_id or "") != self.namespace:
+            raise ValueError("Query workspace does not match store")
         run_id = f"run_{uuid.uuid4().hex}"
-        run_dir = self.root / run_id
-        run_dir.mkdir(parents=True, exist_ok=False)
         run = QueryRun(
             run_id=run_id,
             trace_id=uuid.uuid4().hex,
@@ -328,41 +418,58 @@ class QueryRunStore:
             workspace_id=workspace_id,
             owner_id=owner_id,
             actor_session_id=actor_session_id,
-            artifact_dir=str(run_dir),
+            artifact_dir=str(self.root / run_id),
         )
-        self._write_run(run)
-        await self.append_event(
-            run_id,
-            event_type="run.created",
-            stage_id="request",
-            label="接收问题",
-            status="success",
-            summary="问答任务已创建",
-            input={
-                "document_ids": document_ids or [],
-                "top_k": top_k,
-                "agentic": agentic,
-                "tool_mode": tool_mode,
-                "conversation_id": conversation_id,
-                "parent_run_id": parent_run_id,
-            },
-        )
-        return self.get(run_id) or run
+        with self.transaction() as connection:
+            connection.execute(
+                """INSERT INTO query_run_snapshots
+                (run_id,namespace,owner_id,status,created_at,payload) VALUES(?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    self.namespace,
+                    owner_id,
+                    run.status,
+                    run.created_at.isoformat(),
+                    run.model_dump_json(),
+                ),
+            )
+            if register is not None:
+                register(connection, run)
+            self._event(
+                connection,
+                run,
+                event_type="run.created",
+                stage_id="request",
+                label="接收问题",
+                status="success",
+                summary="问答任务已创建",
+                input={
+                    "document_ids": document_ids or [],
+                    "top_k": top_k,
+                    "agentic": agentic,
+                    "tool_mode": tool_mode,
+                    "conversation_id": conversation_id,
+                    "parent_run_id": parent_run_id,
+                },
+            )
+        return run
 
     def get(self, run_id: str) -> QueryRun | None:
-        path = self._run_dir(run_id) / "run.json"
-        if not path.is_file():
-            return None
-        return QueryRun.model_validate_json(path.read_text(encoding="utf-8"))
+        with self.transaction(write=False) as connection:
+            try:
+                return QueryRun.model_validate_json(self._row(connection, run_id)["payload"])
+            except KeyError:
+                return None
 
     def list(self, *, limit: int = 50) -> list[QueryRun]:
-        runs: list[QueryRun] = []
-        for path in self.root.glob("run_*/run.json"):
-            try:
-                runs.append(QueryRun.model_validate_json(path.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
-        return sorted(runs, key=lambda run: run.created_at, reverse=True)[:limit]
+        with self.transaction(write=False) as connection:
+            return [
+                QueryRun.model_validate_json(row[0])
+                for row in connection.execute(
+                    "SELECT payload FROM query_run_snapshots WHERE namespace=? ORDER BY created_at DESC LIMIT ?",
+                    (self.namespace, limit),
+                )
+            ]
 
     async def recover_interrupted(self) -> list[str]:
         recovered: list[str] = []
@@ -411,53 +518,33 @@ class QueryRunStore:
         return recovered
 
     def list_events(self, run_id: str, *, after_seq: int = 0) -> list[TraceEvent]:
-        path = self._run_dir(run_id) / "events.jsonl"
-        if not path.is_file():
-            return []
-        events: list[TraceEvent] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            event = TraceEvent.model_validate_json(line)
-            if event.seq > after_seq:
-                events.append(event)
-        return events
+        with self.transaction(write=False) as connection:
+            try:
+                self._row(connection, run_id)
+            except KeyError:
+                return []
+            return [
+                TraceEvent.model_validate_json(row[0])
+                for row in connection.execute(
+                    "SELECT payload FROM query_run_events WHERE run_id=? AND seq>? ORDER BY seq",
+                    (run_id, after_seq),
+                )
+            ]
 
     async def append_event(self, run_id: str, **payload: Any) -> TraceEvent:
-        lock = self._locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
-            run = self.get(run_id)
-            if run is None:
-                raise KeyError(run_id)
-            event_type = str(payload.pop("event_type"))
-            event = TraceEvent(
-                seq=run.event_count + 1,
-                run_id=run_id,
-                type=event_type,
-                **payload,
-            )
-            path = self._run_dir(run_id) / "events.jsonl"
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(event.model_dump_json() + "\n")
-            run.event_count = event.seq
-            self._write_run(run)
-        condition = self._conditions.setdefault(run_id, asyncio.Condition())
-        async with condition:
-            condition.notify_all()
-        return event
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            self._assert_writer(row)
+            run = QueryRun.model_validate_json(row["payload"])
+            return self._event(connection, run, **payload)
 
     async def update(self, run_id: str, **changes: Any) -> QueryRun:
-        lock = self._locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
-            run = self.get(run_id)
-            if run is None:
-                raise KeyError(run_id)
-            run = run.model_copy(update=changes)
-            self._write_run(run)
-        condition = self._conditions.setdefault(run_id, asyncio.Condition())
-        async with condition:
-            condition.notify_all()
-        return run
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            self._assert_writer(row)
+            run = QueryRun.model_validate_json(row["payload"]).model_copy(update=changes)
+            self._write(connection, run)
+            return run
 
     async def finalize(
         self,
@@ -475,16 +562,24 @@ class QueryRunStore:
         output: dict[str, Any] | None = None,
         trace: dict[str, Any] | None = None,
     ) -> tuple[QueryRun, TraceEvent]:
-        """Commit terminal snapshot and terminal event before waking SSE consumers."""
-        lock = self._locks.setdefault(run_id, asyncio.Lock())
-        async with lock:
-            run = self.get(run_id)
-            if run is None:
-                raise KeyError(run_id)
-            event = TraceEvent(
-                seq=run.event_count + 1,
-                run_id=run_id,
-                type=event_type,
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            self._assert_writer(row, allow_cancel=status == "cancelled")
+            run = QueryRun.model_validate_json(row["payload"])
+            if run.status in {"completed", "failed", "cancelled"}:
+                raise LeaseLost("Query is already terminal")
+            run = run.model_copy(
+                update={
+                    "status": status,
+                    "completed_at": completed_at,
+                    "answer": answer,
+                    "error": error,
+                }
+            )
+            event = self._event(
+                connection,
+                run,
+                event_type=event_type,
                 stage_id=stage_id,
                 label=label,
                 status=event_status,
@@ -493,56 +588,108 @@ class QueryRunStore:
                 trace=trace or {},
                 error=error,
             )
-            path = self._run_dir(run_id) / "events.jsonl"
-            with path.open("a", encoding="utf-8") as stream:
-                stream.write(event.model_dump_json() + "\n")
-            run = run.model_copy(
-                update={
-                    "status": status,
-                    "completed_at": completed_at,
-                    "answer": answer,
-                    "error": error,
-                    "event_count": event.seq,
-                }
+            connection.execute(
+                "UPDATE query_run_snapshots SET lease_token=NULL,lease_until=NULL WHERE run_id=?",
+                (run_id,),
             )
-            self._write_run(run)
-        condition = self._conditions.setdefault(run_id, asyncio.Condition())
-        async with condition:
-            condition.notify_all()
-        return run, event
+            return run, event
+
+    async def save_answer_checkpoint(self, run_id: str, answer: Answer) -> None:
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            self._assert_writer(row)
+            connection.execute(
+                "UPDATE query_run_snapshots SET checkpoint=? WHERE run_id=?",
+                (answer.model_dump_json(), run_id),
+            )
+
+    def checkpoint(self, run_id: str) -> Answer | None:
+        with self.transaction(write=False) as connection:
+            value = self._row(connection, run_id)["checkpoint"]
+            return Answer.model_validate_json(value) if value else None
+
+    def claim_next(self, worker_id: str) -> tuple[QueryRun, str] | None:
+        """Atomically acquire queued or expired work; only registered workspace runs."""
+        with self.transaction() as connection:
+            now = time.time()
+            row = connection.execute(
+                """SELECT q.* FROM query_run_snapshots q
+                JOIN auth_query_runs a ON a.run_id=q.run_id AND a.workspace_id=q.namespace
+                WHERE q.namespace<>'' AND (q.status='queued' OR
+                    (q.status='running' AND COALESCE(q.lease_until,0)<=?))
+                AND (q.lease_token IS NULL OR COALESCE(q.lease_until,0)<=?)
+                ORDER BY q.created_at,q.run_id LIMIT 1""",
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            token = uuid.uuid4().hex
+            connection.execute(
+                """UPDATE query_run_snapshots SET lease_token=?,lease_until=?,worker_id=?
+                WHERE run_id=?""",
+                (token, now + self.settings.query_worker_lease_seconds, worker_id, row["run_id"]),
+            )
+            return QueryRun.model_validate_json(row["payload"]), token
+
+    def check_execution(self, run_id: str) -> None:
+        with self.transaction(write=False) as connection:
+            self._assert_writer(self._row(connection, run_id))
+
+    def heartbeat(self, run_id: str) -> bool:
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            self._assert_writer(row, allow_cancel=True)
+            connection.execute(
+                "UPDATE query_run_snapshots SET lease_until=? WHERE run_id=?",
+                (time.time() + self.settings.query_worker_lease_seconds, run_id),
+            )
+            return bool(row["cancel_requested"])
+
+    async def request_cancel(self, run_id: str) -> QueryRun:
+        with self.transaction() as connection:
+            row = self._row(connection, run_id)
+            run = QueryRun.model_validate_json(row["payload"])
+            if run.status not in {"queued", "running"}:
+                return run
+            connection.execute(
+                "UPDATE query_run_snapshots SET cancel_requested=1 WHERE run_id=?", (run_id,)
+            )
+            # A queued job has made no external call. Its lease (if just acquired)
+            # is invalidated here so it cannot start after cancellation commits.
+            if run.status == "queued":
+                run.status = "cancelled"
+                run.completed_at = utc_now()
+                run.error = "Cancelled by user"
+                self._event(
+                    connection,
+                    run,
+                    event_type="run.cancelled",
+                    stage_id="response.persist",
+                    label="回答已取消",
+                    status="cancelled",
+                    summary="用户取消了排队问答",
+                )
+                connection.execute(
+                    "UPDATE query_run_snapshots SET lease_token=NULL,lease_until=NULL WHERE run_id=?",
+                    (run_id,),
+                )
+            return run
 
     async def wait_for_events(
         self, run_id: str, *, after_seq: int, timeout: float = 15.0
     ) -> list[TraceEvent]:
-        condition = self._conditions.setdefault(run_id, asyncio.Condition())
-        async with condition:
+        deadline = time.monotonic() + timeout
+        while True:
             events = self.list_events(run_id, after_seq=after_seq)
-            if events or self._is_terminal(run_id):
+            run = self.get(run_id)
+            if events or run is None or run.status in {"completed", "failed", "cancelled"}:
                 return events
-            try:
-                await asyncio.wait_for(condition.wait(), timeout=timeout)
-            except TimeoutError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 return []
-            return self.list_events(run_id, after_seq=after_seq)
+            await asyncio.sleep(min(0.1, remaining))
 
     def recorder(self, run_id: str) -> QueryRunRecorder:
         if self.get(run_id) is None:
             raise KeyError(run_id)
         return QueryRunRecorder(self, run_id)
-
-    def _is_terminal(self, run_id: str) -> bool:
-        run = self.get(run_id)
-        return run is None or run.status in {"completed", "failed", "cancelled"}
-
-    def _run_dir(self, run_id: str) -> Path:
-        target = (self.root / run_id).resolve()
-        if target.parent != self.root.resolve():
-            raise ValueError("Invalid query run ID")
-        return target
-
-    def _write_run(self, run: QueryRun) -> None:
-        path = self._run_dir(run.run_id) / "run.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".json.tmp")
-        temporary.write_text(run.model_dump_json(indent=2), encoding="utf-8")
-        temporary.replace(path)

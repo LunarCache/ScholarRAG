@@ -128,6 +128,34 @@ cd ..
 uv run uvicorn scholarrag.api.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+工作空间模式需要分别启动问答、摄取和评测 Worker。先在 `.env` 设置 `SCHOLARRAG_AUTH_MODE=session` 与 `SCHOLARRAG_QDRANT_URL=http://localhost:6333`，启动 Qdrant：
+
+```bash
+docker compose up -d qdrant
+```
+
+另开终端，在同一仓库、使用相同 `.env` 和数据目录启动 Worker：
+
+```bash
+uv run scholarrag worker
+```
+
+再开一个终端启动摄取 Worker：
+
+```bash
+uv run scholarrag worker --kind ingestion
+```
+
+使用评测功能时，再启动评测 Worker：
+
+```bash
+uv run scholarrag worker --kind evaluation
+```
+
+未启动对应 Worker 时，工作空间问答或上传保持排队；API 重启不会改写正在执行的工作空间任务。所有 Worker 使用相同 `.env`、数据目录和 Qdrant 服务。评测入口位于已完成的问答下方；默认 `local` 阅读/问答仍由 API 执行。
+
+开发结构已更新，不迁移旧摄取任务。旧开发库缺少租约/检查点字段时会明确拒绝启动，请使用新的 `SCHOLARRAG_DATA_DIR`；旧数据不会被自动删除。详情见 [A22](docs/implementation/A22_DURABLE_INGESTION_WORKER.md)。
+
 另开终端启动 Web：
 
 ```bash
@@ -143,7 +171,7 @@ npm run dev
 
 ### 4. Docker Compose
 
-填写 `.env` 后，可启动 Web、API 和 Qdrant：
+填写 `.env` 并设置 `SCHOLARRAG_AUTH_MODE=session` 后，可启动 Web、API、独立问答/摄取/评测 Worker 和 Qdrant：
 
 ```bash
 docker compose up --build
@@ -173,7 +201,7 @@ docker compose down
 uv run scholarrag ingest /path/to/paper.pdf --workspace ws_REPLACE
 ```
 
-命令返回排队任务；`--idempotency-key` 用于安全重试同一上传。v4 迁移会移除旧单用户任务与事件，论文与解析产物保留；默认库现已确认采用新结构，测试目录隔离更正见 [A16](docs/implementation/A16_BROWSER_SESSION.md)。浏览器已接通[工作空间登录](docs/implementation/A16_BROWSER_SESSION.md)和[统一上传](docs/implementation/A17_BROWSER_INGESTION.md)，访问 `http://localhost:3000/workspace` 使用管理员签发的会话令牌。初始化、接口、查询任务进度与迁移详情见[统一队列](docs/implementation/A14_UNIFIED_INGESTION_QUEUE.md)和[摄取授权](docs/implementation/A15_INGESTION_AUTHORIZATION.md)。
+命令返回排队任务；`--idempotency-key` 用于安全重试同一上传。摄取 Worker 通过租约领取，并持久化 MinerU 批次 ID、PaddleOCR 作业 ID、解析候选和索引阶段；恢复使用已有供应商任务，不确定的提交或 embedding 不自动重放。激活文献与私有授权在同一事务发布，详见 [A22](docs/implementation/A22_DURABLE_INGESTION_WORKER.md)。浏览器已接通[工作空间登录](docs/implementation/A16_BROWSER_SESSION.md)和[统一上传](docs/implementation/A17_BROWSER_INGESTION.md)，访问 `http://localhost:3000/workspace` 使用管理员签发的会话令牌。
 
 真实 PDF 默认放在本地 `paper/`，该目录不会被 Git 跟踪。说明见 [`paper/README.md`](paper/README.md)。
 
@@ -202,14 +230,14 @@ uv run scholarrag ask "比较这些论文的方法与实验结论" \
 Web 提问使用异步 Query Run：
 
 ```text
-POST /api/query-runs
-GET  /api/query-runs/{run_id}
-GET  /api/query-runs/{run_id}/events
-GET  /api/query-runs/{run_id}/event-log
-POST /api/query-runs/{run_id}/cancel
+POST /api/workspaces/{workspace_id}/query-runs
+GET  /api/workspaces/{workspace_id}/query-runs/{run_id}
+GET  /api/workspaces/{workspace_id}/query-runs/{run_id}/events
+GET  /api/workspaces/{workspace_id}/query-runs/{run_id}/event-log
+POST /api/workspaces/{workspace_id}/query-runs/{run_id}/cancel
 ```
 
-事件先追加写入 `events.jsonl`，再通过 SSE 推送。终态快照和 terminal event 原子提交，前端在完成、失败或取消时重新与持久化 event log 对账。
+问答快照和事件写入 SQLite 的 `query_run_snapshots` / `query_run_events`，终态快照与 terminal event 在同一事务提交。SSE 从数据库按 seq 轮询，支持跨进程写入和断线续传。工作空间问答由独立 Worker 通过租约领取；排队任务可继续执行，已保存答案检查点可恢复持久化，无检查点的中断执行不会自动重放模型请求。详见 [A21](docs/implementation/A21_DURABLE_QUERY_WORKER.md)。
 
 Web composer 提供三档回答模式（默认「工具 Agent」）：
 
@@ -223,7 +251,11 @@ Web composer 提供三档回答模式（默认「工具 Agent」）：
 
 ### 运行 Ragas
 
-Web 中可以对已完成问题点击“用 Ragas 复评”；CLI 支持 JSON 或 JSONL 数据集：
+工作空间中可对自己已完成的问答点击“开始评测”，填写可选参考答案；运行、停止、轨迹和结果恢复均使用私有工作空间 API。创建请求带幂等键，响应丢失后重试不重复创建任务。用户提供的参考答案标记为 candidate，不自动成为人工 Gold。
+
+评测由独立 Worker 执行，逐指标保存检查点；已完成指标可复用，结果不确定的中断指标不自动重放。Judge HTTP 请求共用进程内 Provider 容量并持续检查授权/租约，最终结果与终态事件同事务发布。配置与验证边界见 [A23](docs/implementation/A23_WORKSPACE_EVALUATIONS.md)。
+
+本地单用户模式的 CLI 仍支持 JSON 或 JSONL 数据集：
 
 ```bash
 uv run scholarrag evaluate evals/your-dataset.jsonl
@@ -252,6 +284,16 @@ uv run scholarrag evaluate evals/your-dataset.jsonl
 | `SCHOLARRAG_INGEST_VISUAL_BACKFILL` | `true`；图/表块缺图时按 bbox 从 PDF 渲染裁剪 |
 | `SCHOLARRAG_RAGAS_JUDGE_MODEL` | `Qwen/Qwen3.6-27B` |
 | `SCHOLARRAG_API_BEARER_TOKEN` | 可选的 API Bearer 鉴权 |
+| `SCHOLARRAG_QUERY_WORKER_CONCURRENCY` | `2`，每个问答 Worker 的并行任务数 |
+| `SCHOLARRAG_QUERY_WORKER_LEASE_SECONDS` | `30`，执行租约时长 |
+| `SCHOLARRAG_QUERY_WORKER_POLL_SECONDS` | `0.5`，问答队列轮询间隔 |
+| `SCHOLARRAG_INGESTION_WORKER_CONCURRENCY` | `1`，每个摄取 Worker 的并行任务数 |
+| `SCHOLARRAG_INGESTION_WORKER_LEASE_SECONDS` | `30`，摄取执行租约时长 |
+| `SCHOLARRAG_INGESTION_WORKER_POLL_SECONDS` | `0.5`，摄取队列轮询间隔 |
+| `SCHOLARRAG_EVALUATION_WORKER_CONCURRENCY` | `1`，每个评测 Worker 的并行任务数 |
+| `SCHOLARRAG_EVALUATION_WORKER_LEASE_SECONDS` | `30`，评测执行租约时长 |
+| `SCHOLARRAG_WORKSPACE_EVALUATION_MAX_ACTIVE` | `16`，每个空间的 queued + running 评测上限 |
+| `SCHOLARRAG_WORKSPACE_EVALUATION_MAX_PER_USER` | `4`，每个用户在当前空间的评测上限 |
 
 Judge 使用 262,144 tokens 上下文、`temperature=0` 和 thinking；评测客户端不发送输出 token 上限。具体配置以 [`.env.example`](.env.example) 为准。
 
@@ -270,10 +312,8 @@ data/
 │       ├── quality/report.json
 │       ├── visual/{block_id}.png   # bbox 渲染兜底的图/表证据
 │       └── pages/page-0001@2x.png
-├── query_runs/{run_id}/
-│   ├── run.json
-│   └── events.jsonl
-└── evaluation_jobs/
+├── scholarrag.db                  # 任务快照、事件、租约、取消标记和检查点
+└── workspaces/{workspace_id}/evaluations/  # 私有评测结果文件
 ```
 
 解析模型、参数或 normalizer 变化会生成新的 `parse_id`，不会覆盖旧 artifacts。只有 active parse 能进入 FTS、文本向量、视觉向量与回答链路。
@@ -372,12 +412,12 @@ docker compose build
 
 ## 当前边界与路线
 
-- 当前定位是个人单用户、单摄取 worker；
-- 后续明确面向多用户与工作空间演进；功能、权限隔离、架构迁移、可靠任务和阶段验收见[实施方向文档](docs/PRODUCTION_ROADMAP.md)，其中规划尚未实施；
+- 当前为开发中的多用户工作空间应用，已有令牌登录、授权查询、个人阅读管理与独立问答/摄取/评测 Worker；供应商、索引与评测指标检查点支持保守恢复；
+- 已完成与未完成项以[实施记录](docs/implementation/README.md)为准，整体生产化计划尚未完成；
 - Parser Gold、QA reviewed set 和 Judge-human correlation 仍需真实人员完成；
 - PP-StructureV3 目前只用于对照，不在生产主链；
 - 视觉证据的消融评测（文本 vs 文本+图）需要积累真实 query runs 后产出结论；
-- 后续可扩展 PostgreSQL、对象存储、多用户 RBAC、任务队列和持续回归门禁。
+- 后续重点是跨实例预算与公平调度、索引批次级检查点、OIDC、PostgreSQL、对象存储和恢复演练。
 
 ## 常见问题
 

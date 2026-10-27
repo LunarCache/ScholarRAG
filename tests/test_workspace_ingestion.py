@@ -21,9 +21,11 @@ from scholarrag.authorization import authorized_documents, bind_authorization
 from scholarrag.domain.access import AccessDenied, IdentityConflict, Role
 from scholarrag.domain.models import CanonicalDocument
 from scholarrag.ingestion.service import IngestionService
+from scholarrag.ingestion.worker import IngestionWorker
 from scholarrag.ingestion.workspaces import IngestionGuard, WorkspaceIngestions
 from scholarrag.providers.mineru import MinerUClient
 from scholarrag.retrieval.index import VectorIndex, VisualIndex
+from scholarrag.runtime import Runtime
 from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.identity import IdentityStore
 
@@ -132,10 +134,18 @@ def test_publish_is_private_and_requires_active_matching_content(team, queue):
     created = enqueue(team, queue)
     job = queue.claim_next()
     with pytest.raises(IdentityConflict, match="not active"):
-        queue.publish(team.owner, job["job_id"], job["document_id"], "missing")
+        queue.publish(
+            team.owner, job["job_id"], job["document_id"], "missing", lease_token=job["lease_token"]
+        )
     document = register(team, job)
     assert team.store.document_ids(team.owner) == []
-    queue.publish(team.owner, job["job_id"], document.document_id, document.parse_id)
+    queue.publish(
+        team.owner,
+        job["job_id"],
+        document.document_id,
+        document.parse_id,
+        lease_token=job["lease_token"],
+    )
     assert queue.read(team.owner, created["job_id"])["status"] == "ready"
     assert team.store.document_ids(team.owner) == [document.document_id]
     admin = team.store.context_for(team.principals["admin"], team.workspace)
@@ -152,7 +162,13 @@ def test_publish_failure_rolls_back_grant_state_events_and_audit(team, queue):
         connection.execute("""CREATE TRIGGER publication_abort BEFORE INSERT ON auth_audit
           WHEN NEW.action='ingestion.published' BEGIN SELECT RAISE(ABORT,'test rollback'); END""")
     with pytest.raises(sqlite3.IntegrityError, match="test rollback"):
-        queue.publish(team.owner, job["job_id"], document.document_id, document.parse_id)
+        queue.publish(
+            team.owner,
+            job["job_id"],
+            document.document_id,
+            document.parse_id,
+            lease_token=job["lease_token"],
+        )
     assert team.store.document_ids(team.owner) == []
     assert queue.read(team.owner, job["job_id"])["status"] == "parsing"
     assert [event["status"] for event in queue.events(team.owner, job["job_id"])] == [
@@ -163,18 +179,17 @@ def test_publish_failure_rolls_back_grant_state_events_and_audit(team, queue):
         assert connection.execute("SELECT parse_id FROM ingestion_jobs").fetchone()[0] is None
 
 
-def test_cancel_and_recovery_never_replay_paid_tasks(team, queue):
+def test_cancel_does_not_make_an_active_lease_available_for_replay(team, queue):
     first = enqueue(team, queue)
     second = enqueue(team, queue, key="second")
     queue.cancel(team.owner, second["job_id"])
     job = queue.claim_next()
     assert job["job_id"] == first["job_id"]
-    queue.recover()
-    queue.recover()
     assert queue.claim_next() is None
-    assert queue.read(team.owner, first["job_id"])["error_code"] == "execution_interrupted"
-    assert len(queue.events(team.owner, first["job_id"])) == 3
-    assert enqueue(team, queue)["status"] == "failed"
+    assert queue.read(team.owner, first["job_id"])["status"] == "parsing"
+    queue.cancel(team.owner, first["job_id"])
+    assert queue.claim_next() is None
+    assert enqueue(team, queue)["status"] == "canceled"
 
 
 @pytest.mark.parametrize("revocation", ["session", "membership", "downgrade"])
@@ -222,7 +237,7 @@ async def test_worker_cancels_inflight_job_and_continues_next_job(team, queue, m
         return document, [], team.settings.artifacts_dir
 
     monkeypatch.setattr(IngestionService, "ingest", ingest)
-    worker = asyncio.create_task(queue.worker())
+    worker = asyncio.create_task(IngestionWorker(Runtime(team.settings)).run())
     try:
         await asyncio.wait_for(started.wait(), 3)
         queue.cancel(team.owner, first["job_id"])
@@ -251,9 +266,12 @@ async def test_real_ingestion_preserves_allocated_id_and_source_artifact(team, q
 
     monkeypatch.setattr(IngestionService, "ingest", traced_ingest)
 
-    async def submit(self, path, *, data_id):
+    async def submit(self, path, *, data_id, on_allocated=None):
         submitted.append(data_id)
-        return SimpleNamespace(batch_id="synthetic", trace_id="synthetic")
+        result = SimpleNamespace(batch_id="synthetic", trace_id="synthetic")
+        if on_allocated:
+            on_allocated(result)
+        return result
 
     async def wait(*args, **kwargs):
         return {"code": 0, "data": {"extract_result": [{"state": "done"}]}}
@@ -310,7 +328,9 @@ async def test_mineru_checks_guard_before_each_remote_request(team, queue):
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     provider = MinerUClient(team.settings, client=client)
-    with bind_authorization(IngestionGuard(team.store, team.owner, job["job_id"])):
+    with bind_authorization(
+        IngestionGuard(team.store, team.owner, job["job_id"], job["lease_token"])
+    ):
         await provider.get_batch("synthetic")
         team.store.revoke_session(team.owner.session_id)
         with pytest.raises(AccessDenied):
@@ -362,30 +382,21 @@ async def test_upload_api_enforces_scope_key_and_hides_internal_fields(team):
     assert "/api/jobs" not in paths and "post" not in paths["/api/documents"]
 
 
-def test_v3_migration_discards_legacy_tasks_but_preserves_documents_and_users(team):
+def test_old_development_task_schema_is_rejected_without_deleting_data(team):
     add_document(team, "preserved")
     with sqlite3.connect(team.settings.sqlite_path) as connection:
         connection.execute("DROP TABLE ingestion_job_events")
         connection.execute("DROP TABLE ingestion_jobs")
-        connection.execute("DELETE FROM auth_schema_versions WHERE version=4")
         connection.execute("CREATE TABLE ingestion_jobs(job_id TEXT PRIMARY KEY,status TEXT)")
-        connection.execute(
-            "CREATE TABLE ingestion_job_events(job_id TEXT REFERENCES ingestion_jobs(job_id),seq INTEGER)"
-        )
-        connection.execute("INSERT INTO ingestion_jobs VALUES('obsolete','queued')")
-        connection.execute("INSERT INTO ingestion_job_events VALUES('obsolete',1)")
-    upgraded = IdentityStore(team.settings)
-    IdentityStore(team.settings)
-    assert upgraded.authenticate(team.sessions["owner"][1]).user_id == team.owner.user_id
+        connection.execute("INSERT INTO ingestion_jobs VALUES('old-task','queued')")
+    with pytest.raises(IdentityConflict, match="new data directory"):
+        IdentityStore(team.settings)
+    assert team.store.authenticate(team.sessions["owner"][1]).user_id == team.owner.user_id
     assert team.catalog.get_document("preserved") is not None
     with sqlite3.connect(team.settings.sqlite_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM ingestion_jobs").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM ingestion_job_events").fetchone()[0] == 0
-        with pytest.raises(sqlite3.IntegrityError):
-            connection.execute("INSERT INTO ingestion_jobs(job_id) VALUES('anonymous')")
-        assert (
-            connection.execute("SELECT MAX(version) FROM auth_schema_versions").fetchone()[0] == 4
-        )
+        assert connection.execute("SELECT * FROM ingestion_jobs").fetchall() == [
+            ("old-task", "queued")
+        ]
 
 
 def test_cli_ingest_submits_to_unified_api_without_direct_parser(team, monkeypatch):
@@ -455,7 +466,7 @@ async def test_provider_error_is_redacted_and_not_automatically_retried(team, qu
     assert "synthetic-secret" not in json.dumps(queue.events(team.owner, job["job_id"]))
 
 
-async def test_session_lifespan_starts_the_unified_worker(team, monkeypatch):
+async def test_api_lifespan_only_admits_upload_until_independent_worker_starts(team, monkeypatch):
     app = create_app(team.settings)
     processed = asyncio.Event()
 
@@ -488,20 +499,25 @@ async def test_session_lifespan_starts_the_unified_worker(team, monkeypatch):
             files={"file": ("paper.pdf", pdf_bytes())},
         )
         assert result.status_code == 202
-        await asyncio.wait_for(processed.wait(), 3)
         job_id = result.json()["job_id"]
+        assert not processed.is_set()
+        assert app.state.runtime.workspace_ingestions.read(team.owner, job_id)["status"] == "queued"
+        processor = IngestionWorker(Runtime(team.settings))
+        await processor.tick()
+        await asyncio.gather(*processor.active.values())
+        assert processed.is_set()
         assert app.state.runtime.workspace_ingestions.read(team.owner, job_id)["status"] == "ready"
     assert all(task.done() for task in app.state.runtime.tasks)
 
 
-def test_unsupported_schema_rolls_back_legacy_task_removal(team):
+def test_unsupported_schema_does_not_modify_old_tasks(team):
     with sqlite3.connect(team.settings.sqlite_path) as connection:
         connection.execute("DROP TABLE ingestion_job_events")
         connection.execute("DROP TABLE ingestion_jobs")
         connection.execute("CREATE TABLE ingestion_jobs(job_id TEXT)")
         connection.execute("INSERT INTO ingestion_jobs VALUES('preserve-on-failed-migration')")
         connection.execute("INSERT INTO auth_schema_versions VALUES(99,0)")
-    with pytest.raises(IdentityConflict, match="Unsupported"):
+    with pytest.raises(IdentityConflict, match="schema changed"):
         IdentityStore(team.settings)
     with sqlite3.connect(team.settings.sqlite_path) as connection:
         assert connection.execute("SELECT * FROM ingestion_jobs").fetchall() == [

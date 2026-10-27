@@ -5,13 +5,22 @@ import math
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+import httpx
 from pydantic import BaseModel, Field
 
+from scholarrag.authorization import check_active_authorization, current_guard
 from scholarrag.config import Settings
+from scholarrag.domain.access import AccessDenied
+from scholarrag.evaluation.transport import AuthorizedJudgeTransport
+from scholarrag.rag.runs import LeaseLost
+
+if TYPE_CHECKING:
+    from scholarrag.evaluation.jobs import EvaluationMetricJournal
 from scholarrag.domain.models import Answer
 from scholarrag.evaluation.visual_metrics import extract_visual_usage
 from scholarrag.rag.runs import EventSink, PipelineTracer, QueryRunStore
@@ -59,6 +68,7 @@ class RagasEvaluator:
         self.settings = settings
         self.catalog = Catalog(settings)
         self.store = ArtifactStore(settings)
+        self.checkpoints: EvaluationMetricJournal | None = None
 
     async def evaluate_rag(
         self,
@@ -79,8 +89,18 @@ class RagasEvaluator:
         parent_query_run_id: str | None = None,
         events: EventSink | None = None,
     ) -> EvaluationRun:
+        guard = current_guard(self.settings)
         chunk_ids = list(answer.retrieval_debug.get("retrieved_chunk_ids", []))
         chunks = self.catalog.chunks_by_ids(chunk_ids)
+        if guard is not None and (
+            case.document_ids != list(guard.document_ids)
+            or any(
+                chunk_id not in chunks or chunks[chunk_id].document_id not in guard.document_ids
+                for chunk_id in chunk_ids
+            )
+            or any(citation.document_id not in guard.document_ids for citation in answer.citations)
+        ):
+            raise AccessDenied("Evaluation evidence outside authorized scope")
         contexts = [chunks[chunk_id].text for chunk_id in chunk_ids if chunk_id in chunks]
         metrics = await self.evaluate_response(
             question=case.question,
@@ -89,6 +109,7 @@ class RagasEvaluator:
             reference=case.reference,
             events=events,
         )
+        check_active_authorization()
         metrics.update(
             self._retrieval_metrics(
                 retrieved_chunk_ids=chunk_ids,
@@ -98,7 +119,12 @@ class RagasEvaluator:
         )
         metrics.update(self._visual_metrics(parent_query_run_id))
         run_id = f"eval_{uuid.uuid4().hex}"
-        artifact = self.settings.data_dir / "evaluations" / f"{run_id}.json"
+        root = (
+            self.settings.data_dir
+            if guard is None
+            else self.settings.data_dir / "workspaces" / guard.context.workspace_id
+        )
+        artifact = root / "evaluations" / f"{run_id}.json"
         run = EvaluationRun(
             run_id=run_id,
             created_at=datetime.now(UTC),
@@ -132,6 +158,9 @@ class RagasEvaluator:
         reference: str | None = None,
         events: EventSink | None = None,
     ) -> dict[str, MetricScore]:
+        current_guard(self.settings)
+        if self.checkpoints:
+            self.checkpoints.initialize()
         try:
             from openai import AsyncOpenAI
             from ragas.embeddings import OpenAIEmbeddings
@@ -152,127 +181,164 @@ class RagasEvaluator:
             api_key=self.settings.siliconflow_api_key.get_secret_value(),
             base_url=self.settings.siliconflow_base_url,
             timeout=180.0,
+            max_retries=0,
+            http_client=httpx.AsyncClient(transport=AuthorizedJudgeTransport(self.settings)),
         )
-        llm = self._remove_judge_output_limits(
-            llm_factory(
-                self.settings.ragas_judge_model,
-                client=client,
-                temperature=self.settings.ragas_judge_temperature,
-                extra_body={
-                    "enable_thinking": self.settings.ragas_judge_enable_thinking,
-                },
-            )
-        )
-        embeddings = OpenAIEmbeddings(
-            client=client,
-            model=self.settings.unified_embedding_model,
-        )
-        response_without_citations = re.sub(r"\[C\d+\]", "", response)
-        tracer = PipelineTracer(events)
-        metrics: dict[str, MetricScore] = {}
-        async with tracer.stage(
-            "evaluation.citation_coverage",
-            "评估 Citation Coverage",
-            parent_stage_id="evaluation.ragas",
-            component="scholarrag.evaluation",
-            input={"response_chars": len(response)},
-        ) as stage:
-            citation_score = self._citation_coverage(response)
-            metrics["citation_coverage"] = MetricScore(value=citation_score, elapsed_seconds=0.0)
-            stage.complete(
-                output={"metric": "citation_coverage", "score": citation_score},
-                summary=f"citation_coverage = {citation_score:.3f}",
-            )
-        scorers: list[tuple[str, Any, dict[str, Any]]] = [
-            (
-                "faithfulness",
-                Faithfulness(llm=llm),
-                {
-                    "user_input": question,
-                    "response": response_without_citations,
-                    "retrieved_contexts": contexts,
-                },
-            ),
-            (
-                "answer_relevancy",
-                AnswerRelevancy(llm=llm, embeddings=embeddings, strictness=1),
-                {"user_input": question, "response": response_without_citations},
-            ),
-        ]
-        if reference:
-            scorers.extend(
-                [
-                    (
-                        "context_precision",
-                        ContextPrecision(llm=llm),
-                        {
-                            "user_input": question,
-                            "reference": reference,
-                            "retrieved_contexts": contexts,
-                        },
-                    ),
-                    (
-                        "context_recall",
-                        ContextRecall(llm=llm),
-                        {
-                            "user_input": question,
-                            "reference": reference,
-                            "retrieved_contexts": contexts,
-                        },
-                    ),
-                    (
-                        "factual_correctness",
-                        FactualCorrectness(llm=llm),
-                        {"response": response_without_citations, "reference": reference},
-                    ),
-                ]
-            )
         try:
-            for name, scorer, kwargs in scorers:
-                metric_start = time.perf_counter()
-                async with tracer.stage(
-                    f"evaluation.{name}",
-                    f"评估 {name}",
-                    parent_stage_id="evaluation.ragas",
-                    component="ragas",
-                    model=self.settings.ragas_judge_model,
-                    input={
-                        "context_count": len(contexts),
-                        "has_reference": reference is not None,
+            llm = self._remove_judge_output_limits(
+                llm_factory(
+                    self.settings.ragas_judge_model,
+                    client=client,
+                    temperature=self.settings.ragas_judge_temperature,
+                    extra_body={
+                        "enable_thinking": self.settings.ragas_judge_enable_thinking,
                     },
-                ) as stage:
-                    try:
-                        result = await scorer.ascore(**kwargs)
-                        value = result.value
-                        if isinstance(value, int | float):
-                            value = float(value)
-                        elapsed = round(time.perf_counter() - metric_start, 3)
-                        metrics[name] = MetricScore(
-                            value=value,
-                            reason=result.reason,
-                            elapsed_seconds=elapsed,
-                        )
-                        stage.complete(
-                            output={"metric": name, "score": value},
-                            summary=f"{name} = {value}",
-                        )
-                    except Exception as exc:  # noqa: BLE001 - metric isolation is deliberate
-                        elapsed = round(time.perf_counter() - metric_start, 3)
-                        reason = f"{type(exc).__name__}: {exc}"[:1000]
-                        metrics[name] = MetricScore(
-                            value=None,
-                            reason=reason,
-                            elapsed_seconds=elapsed,
-                        )
-                        stage.complete(
-                            output={"metric": name, "score": None},
-                            summary=f"{name} 评估失败，其他指标继续执行",
-                            status="warning",
-                            trace={"error": reason},
-                        )
+                )
+            )
+            embeddings = OpenAIEmbeddings(
+                client=client,
+                model=self.settings.unified_embedding_model,
+            )
+            response_without_citations = re.sub(r"\[C\d+\]", "", response)
+            tracer = PipelineTracer(events)
+            metrics: dict[str, MetricScore] = {}
+            async with tracer.stage(
+                "evaluation.citation_coverage",
+                "评估 Citation Coverage",
+                parent_stage_id="evaluation.ragas",
+                component="scholarrag.evaluation",
+                input={"response_chars": len(response)},
+            ) as stage:
+                citation_score = self._citation_coverage(response)
+                metrics["citation_coverage"] = MetricScore(
+                    value=citation_score, elapsed_seconds=0.0
+                )
+                stage.complete(
+                    output={"metric": "citation_coverage", "score": citation_score},
+                    summary=f"citation_coverage = {citation_score:.3f}",
+                )
+            scorers: list[tuple[str, Any, dict[str, Any]]] = [
+                (
+                    "faithfulness",
+                    Faithfulness(llm=llm),
+                    {
+                        "user_input": question,
+                        "response": response_without_citations,
+                        "retrieved_contexts": contexts,
+                    },
+                ),
+                (
+                    "answer_relevancy",
+                    AnswerRelevancy(llm=llm, embeddings=embeddings, strictness=1),
+                    {"user_input": question, "response": response_without_citations},
+                ),
+            ]
+            if reference:
+                scorers.extend(
+                    [
+                        (
+                            "context_precision",
+                            ContextPrecision(llm=llm),
+                            {
+                                "user_input": question,
+                                "reference": reference,
+                                "retrieved_contexts": contexts,
+                            },
+                        ),
+                        (
+                            "context_recall",
+                            ContextRecall(llm=llm),
+                            {
+                                "user_input": question,
+                                "reference": reference,
+                                "retrieved_contexts": contexts,
+                            },
+                        ),
+                        (
+                            "factual_correctness",
+                            FactualCorrectness(llm=llm),
+                            {"response": response_without_citations, "reference": reference},
+                        ),
+                    ]
+                )
+            for name, scorer, kwargs in scorers:
+                metrics[name] = await self._score_metric(
+                    name,
+                    lambda scorer=scorer, kwargs=kwargs: scorer.ascore(**kwargs),
+                    tracer=tracer,
+                    input={"context_count": len(contexts), "has_reference": reference is not None},
+                )
         finally:
             await client.close()
         return metrics
+
+    async def _score_metric(
+        self,
+        name: str,
+        operation: Callable[[], Awaitable[Any]],
+        *,
+        tracer: PipelineTracer,
+        input: dict,
+    ) -> MetricScore:
+        from scholarrag.evaluation.jobs import EvaluationUncertain
+
+        check_active_authorization()
+        if self.checkpoints:
+            saved = self.checkpoints.get(name)
+            if saved is not None:
+                if tracer.sink:
+                    await tracer.sink.emit(
+                        event_type="evaluation.metric.restored",
+                        stage_id=f"evaluation.{name}",
+                        label=f"复用已完成指标 {name}",
+                        status="warning" if saved.value is None else "success",
+                        summary="从指标检查点恢复，未再次调用 Judge",
+                        output={"metric": name, "score": saved.value, "checkpoint_reused": True},
+                    )
+                return saved
+            self.checkpoints.begin(name)
+        start = time.perf_counter()
+        async with tracer.stage(
+            f"evaluation.{name}",
+            f"评估 {name}",
+            parent_stage_id="evaluation.ragas",
+            component="ragas",
+            model=self.settings.ragas_judge_model,
+            input=input,
+        ) as stage:
+            try:
+                result = await operation()
+                check_active_authorization()
+                value = (
+                    float(result.value) if isinstance(result.value, int | float) else result.value
+                )
+                score = MetricScore(
+                    value=value,
+                    reason=result.reason,
+                    elapsed_seconds=round(time.perf_counter() - start, 3),
+                )
+                stage.complete(output={"metric": name, "score": value}, summary=f"{name} = {value}")
+            except (AccessDenied, LeaseLost, EvaluationUncertain):
+                raise
+            except Exception as exc:  # noqa: BLE001 - preserve independent metric failures without exposing provider data
+                check_active_authorization()
+                reason = (
+                    "Judge metric failed"
+                    if current_guard(self.settings) is not None
+                    else f"{type(exc).__name__}: {exc}"[:1000]
+                )
+                score = MetricScore(
+                    value=None, reason=reason, elapsed_seconds=round(time.perf_counter() - start, 3)
+                )
+                stage.complete(
+                    output={"metric": name, "score": None},
+                    summary=f"{name} 评估失败，其他指标继续执行",
+                    status="warning",
+                    trace={"error": reason},
+                )
+            if self.checkpoints:
+                self.checkpoints.finish(name, score)
+            return score
 
     @staticmethod
     def _remove_judge_output_limits(llm: Any) -> Any:
@@ -367,7 +433,10 @@ class RagasEvaluator:
         Answers generated without a recorded query run (e.g. CLI evaluation)
         have no visual metrics to report.
         """
-        store = QueryRunStore(self.settings)
+        guard = current_guard(self.settings)
+        store = QueryRunStore(
+            self.settings, workspace_id=guard.context.workspace_id if guard else None
+        )
         run = store.get(run_id) if run_id else None
         if run is None:
             return {}

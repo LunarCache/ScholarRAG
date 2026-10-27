@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
+from scholarrag.authorization import check_active_authorization
 from scholarrag.config import Settings
 
 
@@ -42,9 +44,15 @@ class ArtifactStore:
 
     @staticmethod
     def write_json(path: Path, payload: Any) -> Path:
+        check_active_authorization()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
-            encoding="utf-8",
-        )
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+            check_active_authorization()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return path

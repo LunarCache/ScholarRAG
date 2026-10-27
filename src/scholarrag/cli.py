@@ -6,6 +6,7 @@ import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import typer
@@ -63,6 +64,49 @@ QUALITY_OUTPUT_OPTION = typer.Option(
 BACKUP_ARGUMENT = typer.Argument(..., dir_okay=False)
 VERIFY_BACKUP_ARGUMENT = typer.Argument(..., exists=True, dir_okay=False)
 SCALE_OUTPUT_ARGUMENT = typer.Argument(Path("data/benchmarks/scale/latest.json"), dir_okay=False)
+
+
+@app.command("worker")
+def worker(
+    kind: Literal["query", "ingestion", "evaluation"] = typer.Option("query", "--kind"),
+) -> None:
+    """Run an independent workspace worker (same data dir and Qdrant as the API)."""
+    from scholarrag.evaluation.worker import EvaluationWorker
+    from scholarrag.ingestion.worker import IngestionWorker
+    from scholarrag.retrieval.index import close_embedded_clients
+    from scholarrag.runtime import Runtime
+    from scholarrag.worker import QueryWorker
+
+    settings = get_settings()
+    if settings.auth_mode != "session":
+        raise typer.BadParameter("The worker requires SCHOLARRAG_AUTH_MODE=session")
+    # Separate query/ingestion processes cannot share an embedded Qdrant directory.
+    # Both worker types use the shared Qdrant service.
+    if not settings.qdrant_url:
+        raise typer.BadParameter("Set SCHOLARRAG_QDRANT_URL to a shared Qdrant service")
+    runtime = Runtime(settings)
+
+    async def serve() -> None:
+        import signal
+
+        processor = {
+            "query": QueryWorker,
+            "ingestion": IngestionWorker,
+            "evaluation": EvaluationWorker,
+        }[kind](runtime)
+        task = asyncio.create_task(processor.run())
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            loop.remove_signal_handler(signal.SIGTERM)
+            close_embedded_clients()
+            await asyncio.to_thread(runtime.telemetry.shutdown)
+
+    asyncio.run(serve())
 
 
 @app.command("check-config")

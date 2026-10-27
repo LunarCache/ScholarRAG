@@ -999,3 +999,15 @@
     gap: 6px;
   }
 }
+
+.evaluation {
+  margin-top: 24px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border-subtle);
+}
+.evaluation label { display: grid; gap: 8px; margin: 12px 0; }
+.evaluation textarea { width: 100%; max-width: 100%; box-sizing: border-box; }
+.evaluationResults { overflow-x: auto; margin: 12px 0; }
+.evaluationResults table { display: table; width: 100%; border-collapse: collapse; }
+.evaluationResults th, .evaluationResults td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border-subtle); }
+.evaluationResults small { display: block; color: var(--text-secondary); overflow-wrap: anywhere; margin-top: 4px; }

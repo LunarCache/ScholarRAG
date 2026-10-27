@@ -232,3 +232,32 @@ async def test_format_failure_preserves_raw_output_and_failed_manifest(tmp_path,
     manifest = json.loads(manifest_path.read_text())
     assert manifest["status"] == "failed" and manifest["error_type"] == "ValueError"
     assert (manifest_path.parent / "raw/mineru/middle_json.json").exists()
+
+
+async def test_allocation_checkpoint_commits_before_pdf_upload_and_failure_blocks_put(tmp_path):
+    source = tmp_path / "synthetic.pdf"
+    source.write_bytes(b"synthetic PDF")
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "data": {
+                    "batch_id": "saved-before-upload",
+                    "file_urls": ["https://storage.example/upload"],
+                },
+            },
+        )
+
+    def checkpoint(job):
+        assert calls == ["POST"] and job.batch_id == "saved-before-upload"
+        raise OSError("simulated checkpoint failure")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        provider = MinerUClient(Settings(data_dir=tmp_path), client=http)
+        with pytest.raises(OSError, match="checkpoint failure"):
+            await provider.submit_local_file(source, data_id="synthetic", on_allocated=checkpoint)
+    assert calls == ["POST"]

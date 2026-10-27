@@ -452,7 +452,7 @@ async def test_query_run_persists_ordered_pipeline_events(tmp_path: Path) -> Non
     assert events[-1].output["candidate_count"] == 2
     assert events[-1].duration_ms is not None
     assert current.status == "completed"
-    assert Path(current.artifact_dir, "events.jsonl").is_file()
+    assert QueryRunStore(settings).list_events(run.run_id) == events
     assert store.list()[0].run_id == run.run_id
 
 

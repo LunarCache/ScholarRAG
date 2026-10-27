@@ -7,10 +7,12 @@ queries must be initiated explicitly through the browser/API. Providers may bill
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import os
 import sqlite3
 import tempfile
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pymupdf
@@ -56,6 +58,32 @@ def main() -> None:
     from scholarrag.domain.access import Role
 
     app = create_app(settings)
+    # This opt-in fixture intentionally runs the real worker classes in one
+    # process so its embedded Qdrant remains completely isolated. Normal API
+    # startup has no workers; deployed processes use a shared Qdrant service.
+    from scholarrag.evaluation.worker import EvaluationWorker
+    from scholarrag.ingestion.worker import IngestionWorker
+    from scholarrag.worker import QueryWorker
+
+    original_lifespan = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def fixture_workers(application):
+        async with original_lifespan(application):
+            runtime = application.state.runtime
+            tasks = [
+                asyncio.create_task(QueryWorker(runtime).run()),
+                asyncio.create_task(IngestionWorker(runtime).run()),
+                asyncio.create_task(EvaluationWorker(runtime).run()),
+            ]
+            try:
+                yield
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+    app.router.lifespan_context = fixture_workers
     if args.resume:
         print(f"Resuming disposable acceptance data: {root}", flush=True)
         uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")

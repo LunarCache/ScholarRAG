@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -99,8 +100,13 @@ class Catalog:
         *,
         source_path: Path,
         artifact_dir: Path,
+        external_connection: sqlite3.Connection | None = None,
     ) -> None:
-        with self._connect() as connection:
+        with (
+            nullcontext(external_connection)
+            if external_connection is not None
+            else self._connect() as connection
+        ):
             connection.execute(
                 """
                 INSERT INTO documents(document_id,title,source_filename,source_sha256,source_path,created_at)
@@ -198,10 +204,21 @@ class Catalog:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def register_metadata(self, document_id: str, parse_id: str, metadata: dict[str, Any]) -> None:
+    def register_metadata(
+        self,
+        document_id: str,
+        parse_id: str,
+        metadata: dict[str, Any],
+        *,
+        external_connection: sqlite3.Connection | None = None,
+    ) -> None:
         from datetime import UTC, datetime
 
-        with self._connect() as connection:
+        with (
+            nullcontext(external_connection)
+            if external_connection is not None
+            else self._connect() as connection
+        ):
             connection.execute(
                 """
                 INSERT INTO document_metadata(document_id,parse_id,metadata,updated_at)

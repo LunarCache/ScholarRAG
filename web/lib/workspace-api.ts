@@ -47,6 +47,14 @@ export type RunEvent = {
   status: string; output: Record<string, unknown>;
 };
 
+export type EvaluationJob = {
+  job_id: string; workspace_id: string; owner_id: string; query_run_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  created_at: string; event_count: number; error: string | null;
+  case: { question: string; reference: string | null; review_status: string };
+  result: { metrics: Record<string, { value: number | boolean | string | null; reason?: string | null }> } | null;
+};
+
 export class WorkspaceApiError extends Error {
   status: number;
   constructor(status: number) {
@@ -152,6 +160,24 @@ export class WorkspaceApi {
         receive(event);
       });
     }, 120000);
+  }
+  createEvaluation(ws: string, runId: string, reference: string | null, key: string, signal: AbortSignal) {
+    return this.json<EvaluationJob>(this.path(ws, "/evaluations"), {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+      body: JSON.stringify({ query_run_id: runId, reference }), signal,
+    });
+  }
+  evaluation(ws: string, id: string, signal: AbortSignal) {
+    return this.json<EvaluationJob>(this.path(ws, `/evaluations/${encodeURIComponent(id)}`), { signal });
+  }
+  latestEvaluation(ws: string, runId: string, signal: AbortSignal) {
+    return this.json<EvaluationJob>(this.path(ws, `/query-runs/${encodeURIComponent(runId)}/evaluations/latest`), { signal });
+  }
+  cancelEvaluation(ws: string, id: string, signal: AbortSignal) {
+    return this.json<EvaluationJob>(this.path(ws, `/evaluations/${encodeURIComponent(id)}/cancel`), { method: "POST", signal });
+  }
+  evaluationEvents(ws: string, id: string, signal: AbortSignal) {
+    return this.json<RunEvent[]>(this.path(ws, `/evaluations/${encodeURIComponent(id)}/event-log`), { signal });
   }
   exportRun(ws: string, id: string, signal: AbortSignal) {
     return this.#perform(this.path(ws, `/query-runs/${encodeURIComponent(id)}/export`), { signal }, (response) => response.blob());

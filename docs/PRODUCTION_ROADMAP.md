@@ -1,6 +1,6 @@
 # ScholarRAG 多用户演进与生产化实施方向
 
-规划基线日期：2026-10-25；进展索引更新：2026-10-26。状态：分阶段实施中，整体目标尚未完成。
+规划基线日期：2026-10-25；进展索引更新：2026-10-27。状态：分阶段实施中，整体目标尚未完成。
 
 相关落地进展：已增加可选的问答 Langfuse 埋点，配置、覆盖范围与验证边界见 [Langfuse 接入与学习指南](LANGFUSE.md)。这不代表本文中的多用户隔离、持久化 Worker 或整体生产化目标已经完成。
 
@@ -29,25 +29,25 @@
 | 领域 | 当前代码或文档体现的能力 | 需要补齐的部分 |
 | --- | --- | --- |
 | 摄取 | MinerU 主解析、Paddle 候选、质量评分、解析版本与审核 | 可恢复分阶段执行、局部纠错、完整删除、多人审核权限 |
-| 检索 | FTS5、文本/视觉向量、RRF、重排、父子块扩展 | 身份权限过滤、范围强约束、索引版本契约与跨存储对账 |
+| 检索 | FTS5、文本/视觉向量、RRF、重排、父子块扩展 | 已具身份过滤与范围约束；仍需索引版本契约与跨存储对账 |
 | 回答 | 单轮、规划与工具 Agent，视觉证据，Claim 与引用 | 语义支持验证、预算控制、上下文分层、结构化比较 |
-| 任务 | 摄取持久化队列、问答事件和快照、SSE、取消 | 问答和评测独立 Worker、租约、检查点、多实例协调 |
-| 身份 | 可选共享 Bearer 与进程内 IP 限流 | 用户登录、工作空间、对象级权限、租户配额与审计 |
+| 任务 | 摄取持久化队列、问答事件和快照、SSE、取消 | 问答/摄取/评测独立 Worker 与租约已落地；仍需批次级恢复、费用预算与公平调度 |
+| 身份 | 会话令牌、用户/空间/成员、对象权限与审计 | OIDC、租户预算配额与完整多人接口 |
 | 存储 | SQLite、本地 Artifact、嵌入式或远程 Qdrant | PostgreSQL 迁移、对象存储、共享事件存储、恢复演练 |
 | 评测 | Ragas、检索与引用指标、人工验收工作台 | 固定回归集、独立 Judge 校准、发布门禁和线上反馈 |
-| 工程 | 后端测试、Docker Compose、备份工具 | CI、浏览器流程测试、故障注入、SLO 和告警 |
+| 工程 | 前后端 CI、浏览器验收、Worker 故障回归、Compose 与备份工具 | 持续浏览器门禁、容量与恢复演练、SLO 和告警 |
 
-需要在实施前复核的具体代码点：
+当前仍需处理的代码与验收边界：
 
-- `src/scholarrag/rag/service.py`：`_claims()` 使用 `supported=bool(spans)`；`_best_span()` 通过词项重合选择片段，不能据此认定语义支持。
-- `src/scholarrag/api/main.py`：问答通过 `asyncio.create_task()` 在 API 进程执行；父轮问题和前 4000 字回答直接拼入追问。
-- `src/scholarrag/rag/runs.py`：重启将未完成问答标记失败；进程内锁不能作为跨进程协调方案。
-- `src/scholarrag/providers/siliconflow.py`：Semaphore 按客户端实例创建，无法限制服务总并发。
-- `src/scholarrag/rag/tools.py`：论文列表读取全库，检索可采用模型传入的 `document_ids`，尚无统一范围与权限交集。
-- `src/scholarrag/api/security.py` 与 `web/app/page.tsx`：可选共享 Bearer 尚未形成完整 Web 登录链路；原生 EventSource 无法直接设置自定义 Authorization Header。
-- 上传入口检查 PDF 扩展名，但缺少应用级总字节限制；解析和供应商压缩包处理还应增加资源预算。
-- `config.py` 的默认质量模式为 `audit`；视觉质量路由可以强制开启图片，且当前没有图片数量预算。
-- 仓库当前未见 `.github` CI 配置；文档中的验证命令不代表 CI 已经自动执行。
+- `rag/service.py`：引用定位与语义支持状态已分离，语义支持仍为 `not_checked`；需人工校准验证器。
+- `rag/execution.py`：父轮问题和前 4000 字回答直接拼入追问；尚无分层会话记忆。
+- `worker.py` / `rag/runs.py`：工作空间问答已使用独立 Worker、SQLite 租约与事件、答案检查点；只有答案生成完成后的恢复，没有供应商请求或检索阶段续跑。
+- `ingestion/workspaces.py` / `ingestion/worker.py`：摄取已独立执行，供应商任务 ID、候选产物与索引阶段可恢复；索引中断的不确定调用不会自动重放，仍需批次级对账。评测已由 A23 拆出，新增私有授权、逐指标检查点与事务终态发布。
+- `providers/siliconflow.py`：已有单进程共享并发控制，但跨进程的供应商额度与费用预算未实现。
+- `config.py`：默认质量模式为 `audit`；视觉输入仍缺总预算。
+- `.github/workflows/ci.yml`：已有前后端回归、格式与审计门禁；最新已推送提交的 CI 已通过，A21–A23 本地改动需提交后单独验证。
+
+开发阶段直接采用 SQLite 问答结构，不迁移旧 JSON 问答历史。摄取采用新的开发 Schema，不迁移旧任务；缺少新字段时使用新数据目录，不自动删除旧库。详细实现和限制见 [A21](implementation/A21_DURABLE_QUERY_WORKER.md) 、[A22](implementation/A22_DURABLE_INGESTION_WORKER.md) 和 [A23](implementation/A23_WORKSPACE_EVALUATIONS.md)。
 
 ## 3. 多用户领域与权限设计
 

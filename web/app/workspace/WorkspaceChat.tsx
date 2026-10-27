@@ -7,6 +7,7 @@ import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { RunEvent, WorkspaceApi, WorkspaceApiError, WorkspacePaper, WorkspaceRun, workspaceError } from "../../lib/workspace-api";
 import styles from "./workspace.module.css";
+import { WorkspaceEvaluation } from "./WorkspaceEvaluation";
 
 const terminal = (run: WorkspaceRun) => !["queued", "running"].includes(run.status);
 const labels = { queued: "排队中", running: "回答中", completed: "已完成", failed: "失败", cancelled: "已取消" };
@@ -279,6 +280,8 @@ export function WorkspaceChat({ client, workspaceId, papers, onError, onOpenPdf,
             {run.answer && <button disabled={busy} onClick={() => void prepareReport()}>准备导出证据报告</button>}
             {report && <a href={report} download={`scholarrag-${run.run_id}.md`}>下载证据报告.md</a>}
           </div>
+
+          {run.status === "completed" && <WorkspaceEvaluation key={`${workspaceId}:${run.run_id}`} client={client} workspaceId={workspaceId} runId={run.run_id} onError={onError} />}
 
           <details>
             <summary>执行轨迹（最近 {events.length} 项）</summary>

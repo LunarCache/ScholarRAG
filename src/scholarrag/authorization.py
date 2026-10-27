@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -19,8 +19,11 @@ class AuthorizationGuard:
     identities: IdentityStore
     context: AccessContext
     document_ids: tuple[str, ...]
+    lease_check: Callable[[], None] | None = None
 
     def check(self) -> None:
+        if self.lease_check is not None:
+            self.lease_check()
         self.identities.authorize(self.context, "query")
         allowed = set(self.identities.document_ids(self.context))
         if not set(self.document_ids).issubset(allowed):

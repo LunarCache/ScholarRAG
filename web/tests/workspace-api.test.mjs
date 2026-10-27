@@ -180,3 +180,36 @@ test("stopping an answer cancels its query run rather than an ingestion job", as
   });
   assert.equal((await client.cancelRun("ws", "run-active", signal())).status, "cancelled");
 });
+
+test("evaluation creation preserves idempotency and cannot override parent scope", async () => {
+  const seen = [];
+  const client = new WorkspaceApi(base, "token", async (url, init) => {
+    seen.push({ url, init }); return json({ job_id: "evjob-test", status: "queued" });
+  });
+  await client.createEvaluation("ws-one", "run-one", "user supplied", "same-request", signal());
+  await client.createEvaluation("ws-one", "run-one", "user supplied", "same-request", signal());
+  for (const { url, init } of seen) {
+    assert.equal(url, `${base}/api/workspaces/ws-one/evaluations`);
+    assert.equal(init.method, "POST");
+    assert.equal(init.headers.get("Idempotency-Key"), "same-request");
+    assert.deepEqual(JSON.parse(init.body), { query_run_id: "run-one", reference: "user supplied" });
+    assert.equal(init.headers.get("Authorization"), "Bearer token");
+  }
+});
+
+test("evaluation reads, history, events and cancellation stay in the selected workspace", async () => {
+  const seen = [];
+  const client = new WorkspaceApi(base, "token", async (url, init) => {
+    seen.push({ url, method: init.method ?? "GET" }); return json({ job_id: "evjob-test", status: "completed" });
+  });
+  await client.evaluation("ws-two", "evjob-test", signal());
+  await client.latestEvaluation("ws-two", "run-test", signal());
+  await client.evaluationEvents("ws-two", "evjob-test", signal());
+  await client.cancelEvaluation("ws-two", "evjob-test", signal());
+  assert.deepEqual(seen, [
+    { url: `${base}/api/workspaces/ws-two/evaluations/evjob-test`, method: "GET" },
+    { url: `${base}/api/workspaces/ws-two/query-runs/run-test/evaluations/latest`, method: "GET" },
+    { url: `${base}/api/workspaces/ws-two/evaluations/evjob-test/event-log`, method: "GET" },
+    { url: `${base}/api/workspaces/ws-two/evaluations/evjob-test/cancel`, method: "POST" },
+  ]);
+});

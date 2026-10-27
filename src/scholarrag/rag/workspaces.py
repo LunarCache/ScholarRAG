@@ -1,9 +1,8 @@
-"""Private workspace query ownership and admission; execution remains single-process."""
+"""Private workspace query admission; execution belongs to the query worker."""
 
 from __future__ import annotations
 
 import asyncio
-import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 from fastapi import HTTPException
@@ -22,19 +21,10 @@ def public_run(run: QueryRun) -> dict:
 
 
 class WorkspaceQueries:
-    def __init__(
-        self,
-        settings: Settings,
-        identities: IdentityStore,
-        execute: Callable[[str, QueryRunStore], Awaitable[None]],
-        tasks: set[asyncio.Task],
-    ) -> None:
+    def __init__(self, settings: Settings, identities: IdentityStore) -> None:
         self.settings = settings
         self.identities = identities
-        self.execute = execute
-        self.tasks = tasks
         self.stores: dict[str, QueryRunStore] = {}
-        self.active: dict[str, tuple[AccessContext, asyncio.Task]] = {}
         self.lock = asyncio.Lock()
 
     def store(self, workspace_id: str) -> QueryRunStore:
@@ -82,12 +72,6 @@ class WorkspaceQueries:
     async def create(self, context: AccessContext, request: QueryRequest) -> QueryRun:
         async with self.lock:
             self.identities.authorize(context, "query")
-            if (
-                len(self.active) >= self.settings.workspace_query_max_active
-                or sum(ctx.user_id == context.user_id for ctx, _ in self.active.values())
-                >= self.settings.workspace_query_max_per_user
-            ):
-                raise HTTPException(status_code=429, detail="Too many active query runs")
             try:
                 document_ids = DocumentScope.intersect(
                     self.identities.document_ids(context)
@@ -118,49 +102,20 @@ class WorkspaceQueries:
                 workspace_id=context.workspace_id,
                 owner_id=context.user_id,
                 actor_session_id=context.session_id,
+                register=lambda connection, run: self.identities.register_query_run(
+                    context,
+                    run,
+                    connection=connection,
+                    max_active=self.settings.workspace_query_max_active,
+                    max_per_user=self.settings.workspace_query_max_per_user,
+                ),
             )
-            try:
-                self.identities.register_query_run(context, run)
-            except BaseException:
-                shutil.rmtree(store.root / run.run_id)
-                raise
-            task = asyncio.create_task(self.execute(run.run_id, store))
-            self.active[run.run_id] = (context, task)
-            self.tasks.add(task)
-
-            def discard(completed: asyncio.Task) -> None:
-                self.active.pop(run.run_id, None)
-                self.tasks.discard(completed)
-
-            task.add_done_callback(discard)
             return run
 
     async def cancel(self, context: AccessContext, run_id: str) -> QueryRun:
         self.read(context, run_id)
-        active = self.active.get(run_id)
-        if active and not active[1].done():
-            active[1].cancel()
-            await asyncio.gather(active[1], return_exceptions=True)
-        current = self.read(context, run_id)
-        if current.status in {"queued", "running"}:
-            from scholarrag.rag.runs import utc_now
-
-            await self.store(context.workspace_id).finalize(
-                run_id,
-                status="cancelled",
-                completed_at=utc_now(),
-                error="Cancelled by user",
-                event_type="run.cancelled",
-                stage_id="response.persist",
-                label="回答已取消",
-                event_status="cancelled",
-                summary="用户取消了本次问答",
-            )
+        await self.store(context.workspace_id).request_cancel(run_id)
         return self.read(context, run_id)
-
-    async def recover(self) -> None:
-        for workspace_id in self.identities.query_workspaces():
-            await self.store(workspace_id).recover_interrupted()
 
     async def events(
         self,

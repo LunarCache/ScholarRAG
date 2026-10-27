@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import uuid
@@ -11,6 +12,7 @@ from typing import Any
 from scholarrag.authorization import check_active_authorization
 from scholarrag.config import Settings
 from scholarrag.domain.models import CanonicalDocument, Chunk
+from scholarrag.ingestion.checkpoints import IngestionJournal, IngestionUncertain
 from scholarrag.ingestion.chunker import SemanticChunker
 from scholarrag.ingestion.mineru_normalizer import MinerUNormalizer
 from scholarrag.ingestion.paddleocr_normalizer import PaddleOCRNormalizer
@@ -20,6 +22,7 @@ from scholarrag.ingestion.visual_backfill import VisualEvidenceBackfill
 from scholarrag.knowledge.service import MetadataExtractor
 from scholarrag.providers.mineru import MinerUClient
 from scholarrag.providers.paddleocr import PaddleOCRAPIClient
+from scholarrag.rag.runs import LeaseLost
 from scholarrag.retrieval.index import VectorIndex, VisualIndex
 from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
@@ -39,9 +42,16 @@ class ParseCandidate:
 
 
 class IngestionService:
-    def __init__(self, settings: Settings, *, document_id: str | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        document_id: str | None = None,
+        journal: IngestionJournal | None = None,
+    ) -> None:
         if document_id is not None and not re.fullmatch(r"doc_[0-9a-f]{32}", document_id):
             raise ValueError("Invalid allocated document ID")
+        self.journal = journal
         self.document_id = document_id
         self.settings = settings
         self.store = ArtifactStore(settings)
@@ -51,6 +61,68 @@ class IngestionService:
         )
         self.router = ParseRouter(min_score_improvement=settings.parse_route_min_score_improvement)
 
+    def _candidate_record(self, candidate: ParseCandidate) -> dict:
+        paths = ["canonical/document.json", "chunks/chunks.json", "quality/report.json"]
+        return {
+            "state": "ready",
+            "parse_dir": str(candidate.parse_dir.resolve()),
+            "source_path": str(candidate.source_path.resolve()),
+            "hashes": {name: self.store.sha256(candidate.parse_dir / name) for name in paths},
+        }
+
+    def _restore_candidate(self, record: dict) -> ParseCandidate:
+        check_active_authorization()
+        parse_dir = Path(record["parse_dir"])
+        if not parse_dir.resolve().is_relative_to(self.settings.artifacts_dir.resolve()):
+            raise ValueError("Candidate is outside the artifact store")
+        for name, expected in record["hashes"].items():
+            if self.store.sha256(parse_dir / name) != expected:
+                raise ValueError("Candidate checkpoint artifact changed")
+        document = CanonicalDocument.model_validate_json(
+            (parse_dir / "canonical/document.json").read_text()
+        )
+        source = Path(record["source_path"])
+        if (
+            document.document_id != self.document_id
+            or self.store.sha256(source) != document.source_sha256
+        ):
+            raise ValueError("Candidate checkpoint identity changed")
+        chunks = [
+            Chunk.model_validate(row)
+            for row in json.loads((parse_dir / "chunks/chunks.json").read_text())
+        ]
+        quality = ParseQualityReport.model_validate_json(
+            (parse_dir / "quality/report.json").read_text()
+        )
+        return ParseCandidate(document, chunks, parse_dir, source, quality)
+
+    def _configuration_checkpoint(self) -> None:
+        if self.journal is None:
+            return
+        keys = [
+            "mineru_base_url",
+            "mineru_model",
+            "mineru_language",
+            "mineru_is_ocr",
+            "paddle_model",
+            "parse_quality_mode",
+            "parse_quality_accept_score",
+            "parse_quality_review_score",
+            "parse_fallback_mode",
+            "parse_route_min_score_improvement",
+            "ingest_visual_backfill",
+            "siliconflow_base_url",
+            "embedding_model",
+            "multimodal_embedding_model",
+            "embedding_dimensions",
+            "qdrant_url",
+        ]
+        configuration = {key: getattr(self.settings, key) for key in keys}
+        old = self.journal.load("configuration")
+        if old is not None and old != configuration:
+            raise ValueError("Ingestion configuration changed; submit a new task")
+        self.journal.save("configuration", configuration)
+
     async def ingest(
         self,
         source: Path,
@@ -59,6 +131,18 @@ class IngestionService:
     ) -> tuple[CanonicalDocument, list[Chunk], Path]:
         """Parse with MinerU, optionally evaluate Paddle, then activate exactly one candidate."""
         check_active_authorization()
+        self._configuration_checkpoint()
+        selected_record = self.journal.load("selected") if self.journal else None
+        if selected_record is not None:
+            selected = await asyncio.to_thread(
+                self._restore_candidate, selected_record["candidate"]
+            )
+            await self._activate_candidate(
+                selected,
+                decision=ParseRouteDecision.model_validate(selected_record["decision"]),
+                route_path=Path(selected_record["route_path"]),
+            )
+            return selected.document, selected.chunks, selected.parse_dir
         primary = await self._parse_mineru_candidate(source, existing_batch_id=existing_batch_id)
         fallback: ParseCandidate | None = None
         fallback_error: str | None = None
@@ -68,6 +152,8 @@ class IngestionService:
             else:
                 try:
                     fallback = await self._parse_paddle_candidate(source)
+                except (IngestionUncertain, LeaseLost):
+                    raise
                 except Exception as exc:  # noqa: BLE001 - route artifact must preserve failures
                     fallback_error = f"{type(exc).__name__}: {exc}"
 
@@ -96,6 +182,15 @@ class IngestionService:
             actual_selected_parse_id=selected.document.parse_id,
             fallback_error=fallback_error,
         )
+        if self.journal:
+            self.journal.save(
+                "selected",
+                {
+                    "candidate": self._candidate_record(selected),
+                    "decision": decision.model_dump(mode="json"),
+                    "route_path": str(route_path),
+                },
+            )
         await self._activate_candidate(selected, decision=decision, route_path=route_path)
         self._mark_unselected_candidates(candidates, selected.document.parse_id, route_path)
         return selected.document, selected.chunks, selected.parse_dir
@@ -130,6 +225,11 @@ class IngestionService:
         *,
         existing_batch_id: str | None = None,
     ) -> ParseCandidate:
+        saved = self.journal.load("mineru") if self.journal else None
+        if saved and saved["state"] == "ready":
+            return await asyncio.to_thread(self._restore_candidate, saved)
+        if saved and saved["state"] == "submitting":
+            raise IngestionUncertain("MinerU submission outcome unknown")
         source = source.resolve()
         source_hash = self.store.sha256(source)
         document_id = self.document_id or f"doc_{source_hash[:24]}"
@@ -150,18 +250,34 @@ class IngestionService:
 
         client = MinerUClient(self.settings)
         try:
-            batch_id = existing_batch_id
+            batch_id = saved.get("batch_id") if saved else existing_batch_id
             if batch_id is None:
-                job = await client.submit_local_file(source, data_id=document_id)
+                if self.journal:
+                    self.journal.save("mineru", {"state": "submitting"})
+
+                def allocated(job):
+                    self.journal.save("mineru", {"state": "allocated", "batch_id": job.batch_id})
+
+                options = {"on_allocated": allocated} if self.journal else {}
+                job = await client.submit_local_file(source, data_id=document_id, **options)
                 batch_id = job.batch_id
                 manifest["submit_trace_id"] = job.trace_id
+                if self.journal:
+                    self.journal.save("mineru", {"state": "submitted", "batch_id": batch_id})
                 manifest["batch_id"] = batch_id
                 self.store.write_json(manifest_path, manifest)
                 response = await client.wait_for_result(batch_id)
             else:
                 manifest["batch_id"] = batch_id
+                self.store.write_json(manifest_path, manifest)
                 response = await client.get_batch(batch_id)
                 rows = response.get("data", {}).get("extract_result", [])
+                if (
+                    saved
+                    and saved["state"] == "allocated"
+                    and (not rows or rows[0].get("state") == "waiting-file")
+                ):
+                    raise IngestionUncertain("MinerU upload outcome unknown")
                 if not rows or rows[0].get("state") != "done":
                     response = await client.wait_for_result(batch_id)
             raw_dir = parse_dir / "raw" / "mineru"
@@ -169,12 +285,16 @@ class IngestionService:
             await client.download_and_extract(response, raw_dir)
         except Exception as exc:
             self._mark_failed(manifest_path, manifest, exc)
+            checkpoint = self.journal.load("mineru") if self.journal else None
+            if checkpoint and checkpoint["state"] in {"submitting", "allocated"}:
+                raise IngestionUncertain("MinerU submission or upload outcome unknown") from exc
             raise
         finally:
             await client.close()
 
         try:
-            document = MinerUNormalizer().normalize(
+            document = await asyncio.to_thread(
+                MinerUNormalizer().normalize,
                 raw_dir,
                 document_id=document_id,
                 parse_id=parse_id,
@@ -183,13 +303,26 @@ class IngestionService:
                 provider_model=self.settings.mineru_model,
             )
             manifest["query_trace_id"] = response.get("trace_id")
-            return self._prepare_candidate(document, parse_dir, preserved_source, manifest=manifest)
+            candidate = await asyncio.to_thread(
+                self._prepare_candidate, document, parse_dir, preserved_source, manifest=manifest
+            )
+            if self.journal:
+                self.journal.save(
+                    "mineru",
+                    {**(self.journal.load("mineru") or {}), **self._candidate_record(candidate)},
+                )
+            return candidate
         except Exception as exc:
             self._mark_failed(manifest_path, manifest, exc)
             raise
 
     async def _parse_paddle_candidate(self, source: Path) -> ParseCandidate:
         check_active_authorization()
+        saved = self.journal.load("paddleocr") if self.journal else None
+        if saved and saved["state"] == "ready":
+            return await asyncio.to_thread(self._restore_candidate, saved)
+        if saved and saved["state"] == "submitting":
+            raise IngestionUncertain("PaddleOCR submission outcome unknown")
         source = source.resolve()
         source_hash = self.store.sha256(source)
         document_id = self.document_id or f"doc_{source_hash[:24]}"
@@ -211,19 +344,32 @@ class IngestionService:
         self.store.write_json(manifest_path, manifest)
         client = PaddleOCRAPIClient(self.settings)
         try:
-            options, options_payload = client.document_options(self.settings.paddle_model)
-            job = await client.submit_document(
-                source, model=self.settings.paddle_model, options=options
-            )
-            submission = client.to_dict(job)
-            job_id = (
-                submission.get("job_id") or submission.get("jobId") or getattr(job, "job_id", None)
-            )
-            if not job_id:
-                raise RuntimeError("PaddleOCR submission did not return a job ID")
+            if saved:
+                job_id = saved["job_id"]
+                options_payload = saved["options"]
+            else:
+                options, options_payload = client.document_options(self.settings.paddle_model)
+                if self.journal:
+                    self.journal.save("paddleocr", {"state": "submitting"})
+                job = await client.submit_document(
+                    source, model=self.settings.paddle_model, options=options
+                )
+                submission = client.to_dict(job)
+                job_id = (
+                    submission.get("job_id")
+                    or submission.get("jobId")
+                    or getattr(job, "job_id", None)
+                )
+                if not job_id:
+                    raise RuntimeError("PaddleOCR submission did not return a job ID")
+                if self.journal:
+                    self.journal.save(
+                        "paddleocr",
+                        {"state": "submitted", "job_id": str(job_id), "options": options_payload},
+                    )
+                self.store.write_json(raw_dir / "submission.json", submission)
             manifest["job_id"] = str(job_id)
             manifest["options"] = options_payload
-            self.store.write_json(raw_dir / "submission.json", submission)
             self.store.write_json(manifest_path, manifest)
             result = await client.wait_document(str(job_id))
             payload = client.to_dict(result)
@@ -232,9 +378,13 @@ class IngestionService:
             manifest["resource_count"] = len(resource_paths)
         except Exception as exc:
             self._mark_failed(manifest_path, manifest, exc)
+            checkpoint = self.journal.load("paddleocr") if self.journal else None
+            if checkpoint and checkpoint["state"] == "submitting":
+                raise IngestionUncertain("PaddleOCR submission outcome unknown") from exc
             raise
 
-        document = PaddleOCRNormalizer().normalize(
+        document = await asyncio.to_thread(
+            PaddleOCRNormalizer().normalize,
             payload_path,
             resource_dir=resources_dir,
             output_dir=parse_dir / "canonical",
@@ -246,7 +396,15 @@ class IngestionService:
             provider_model=self.settings.paddle_model,
         )
         manifest["provider_job_id"] = document.metadata.get("provider_job_id")
-        return self._prepare_candidate(document, parse_dir, preserved_source, manifest=manifest)
+        candidate = await asyncio.to_thread(
+            self._prepare_candidate, document, parse_dir, preserved_source, manifest=manifest
+        )
+        if self.journal:
+            self.journal.save(
+                "paddleocr",
+                {**(self.journal.load("paddleocr") or {}), **self._candidate_record(candidate)},
+            )
+        return candidate
 
     def _prepare_candidate(
         self,
@@ -323,24 +481,48 @@ class IngestionService:
             raise ParseQualityError(
                 f"Parse route {decision.route_id} requires {decision.recommended_action}"
             )
-        indexed_count = await VectorIndex(self.settings).index(candidate.chunks)
-        visual_indexed_count = await VisualIndex(self.settings).index(
-            candidate.document, candidate.chunks
+
+        async def index_stage(key, operation):
+            saved = self.journal.load(key) if self.journal else None
+            if saved:
+                if saved["parse_id"] != candidate.document.parse_id:
+                    raise ValueError("Index checkpoint parse changed")
+                if saved["state"] != "done":
+                    raise IngestionUncertain("Embedding/index outcome unknown")
+                return saved["count"]
+            if self.journal:
+                self.journal.save(
+                    key, {"state": "running", "parse_id": candidate.document.parse_id}
+                )
+            result = await operation()
+            if self.journal:
+                self.journal.save(
+                    key, {"state": "done", "parse_id": candidate.document.parse_id, "count": result}
+                )
+            return result
+
+        indexed_count = await index_stage(
+            "text_index", lambda: VectorIndex(self.settings).index(candidate.chunks)
         )
-        catalog = Catalog(self.settings)
+        visual_indexed_count = await index_stage(
+            "visual_index",
+            lambda: VisualIndex(self.settings).index(candidate.document, candidate.chunks),
+        )
         check_active_authorization()
-        catalog.register(
-            candidate.document,
-            candidate.chunks,
-            source_path=candidate.source_path,
-            artifact_dir=candidate.parse_dir,
-        )
-        metadata = MetadataExtractor.extract(candidate.document)
-        catalog.register_metadata(
-            candidate.document.document_id,
-            candidate.document.parse_id,
-            metadata.model_dump(mode="json"),
-        )
+        if self.journal is None:
+            catalog = Catalog(self.settings)
+            catalog.register(
+                candidate.document,
+                candidate.chunks,
+                source_path=candidate.source_path,
+                artifact_dir=candidate.parse_dir,
+            )
+            metadata = MetadataExtractor.extract(candidate.document)
+            catalog.register_metadata(
+                candidate.document.document_id,
+                candidate.document.parse_id,
+                metadata.model_dump(mode="json"),
+            )
         manifest_path = candidate.parse_dir / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest.update(

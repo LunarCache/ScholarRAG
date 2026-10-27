@@ -3,6 +3,7 @@ services:
     build: .
     env_file: .env
     environment:
+      SCHOLARRAG_AUTH_MODE: session
       SCHOLARRAG_DATA_DIR: /data
       SCHOLARRAG_EVALS_DIR: /app/evals
       SCHOLARRAG_QDRANT_URL: http://qdrant:6333
@@ -19,6 +20,54 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
+
+  query-worker:
+    build: .
+    command: ["uv", "run", "scholarrag", "worker"]
+    env_file: .env
+    environment:
+      SCHOLARRAG_AUTH_MODE: session
+      SCHOLARRAG_DATA_DIR: /data
+      SCHOLARRAG_EVALS_DIR: /app/evals
+      SCHOLARRAG_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - scholarrag-data:/data
+      - ./evals:/app/evals
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+  ingestion-worker:
+    build: .
+    command: ["uv", "run", "scholarrag", "worker", "--kind", "ingestion"]
+    env_file: .env
+    environment:
+      SCHOLARRAG_AUTH_MODE: session
+      SCHOLARRAG_DATA_DIR: /data
+      SCHOLARRAG_EVALS_DIR: /app/evals
+      SCHOLARRAG_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - scholarrag-data:/data
+      - ./evals:/app/evals
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+  evaluation-worker:
+    build: .
+    command: ["uv", "run", "scholarrag", "worker", "--kind", "evaluation"]
+    env_file: .env
+    environment:
+      SCHOLARRAG_AUTH_MODE: session
+      SCHOLARRAG_DATA_DIR: /data
+      SCHOLARRAG_EVALS_DIR: /app/evals
+      SCHOLARRAG_QDRANT_URL: http://qdrant:6333
+    volumes:
+      - scholarrag-data:/data
+      - ./evals:/app/evals
+    depends_on:
+      qdrant:
+        condition: service_healthy
 
   web:
     build:

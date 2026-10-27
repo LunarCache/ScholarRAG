@@ -5,6 +5,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from scholarrag.authorization import check_active_authorization
 from scholarrag.config import Settings
 
 
@@ -70,6 +71,7 @@ class PaddleOCRAPIClient:
             ) from exc
 
         def run() -> Any:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 return client.parse_document(
@@ -103,6 +105,7 @@ class PaddleOCRAPIClient:
         destination.mkdir(parents=True, exist_ok=True)
 
         def run() -> tuple[Any, list[str]]:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 result = client.parse_document(
@@ -135,6 +138,7 @@ class PaddleOCRAPIClient:
             ) from exc
 
         def run() -> Any:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 return client.submit_document_parsing(
@@ -157,6 +161,7 @@ class PaddleOCRAPIClient:
             ) from exc
 
         def run() -> Any:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 return client.wait_document_parsing_result(job_id)
@@ -177,6 +182,7 @@ class PaddleOCRAPIClient:
         destination.mkdir(parents=True, exist_ok=True)
 
         def run() -> list[str]:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 return self._save_resources(client, result, destination)
@@ -197,6 +203,7 @@ class PaddleOCRAPIClient:
         destination.mkdir(parents=True, exist_ok=True)
 
         def run() -> list[str]:
+            check_active_authorization()
             client = PaddleOCRClient(token=self.token, request_timeout=300.0, poll_timeout=1200.0)
             try:
                 saved: list[str] = []
@@ -242,6 +249,7 @@ class PaddleOCRAPIClient:
         saved: list[str] = []
         for group, resources in groups.items():
             for filename, resource_url in sorted(resources.items()):
+                check_active_authorization()
                 if not resource_url:
                     continue
                 relative = PurePosixPath(filename)

@@ -64,7 +64,7 @@ def add_document(team, name):
 def test_schema_is_idempotent_and_sessions_are_hashed(team):
     IdentityStore(team.settings)
     with sqlite3.connect(team.settings.sqlite_path) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM auth_schema_versions").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM auth_schema_versions").fetchone()[0] == 5
         assert connection.execute("SELECT COUNT(*) FROM auth_users").fetchone()[0] == 5
         values = str(connection.execute("SELECT * FROM auth_sessions").fetchall())
         audit = str(connection.execute("SELECT * FROM auth_audit").fetchall())
