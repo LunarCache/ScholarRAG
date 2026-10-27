@@ -25,6 +25,7 @@ from scholarrag.rag.runs import LeaseLost
 from scholarrag.storage.artifacts import ArtifactStore
 from scholarrag.storage.catalog import Catalog
 from scholarrag.storage.identity import IdentityStore
+from scholarrag.storage.scheduling import claim_fair_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -218,12 +219,14 @@ class WorkspaceIngestions:
     def claim_next(self, worker_id: str = "manual") -> dict | None:
         with self.identities._transaction() as connection:
             now = time.time()
-            row = connection.execute(
-                """SELECT * FROM ingestion_jobs WHERE status='queued'
+            row = claim_fair_candidate(
+                connection,
+                "ingestion",
+                """SELECT *,job_id AS scheduling_id FROM ingestion_jobs WHERE status='queued'
                    OR (status='parsing' AND COALESCE(lease_until,0)<=?)
-                   ORDER BY created_at,job_id LIMIT 1""",
+                   """,
                 (now,),
-            ).fetchone()
+            )
             if row is None:
                 return None
             connection.execute(

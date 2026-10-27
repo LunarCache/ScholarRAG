@@ -2,6 +2,18 @@ import { consumeEventStream } from "./workspace-sse.ts";
 import type { StreamEvent } from "./workspace-sse.ts";
 
 export type Profile = { user_id: string; display_name: string };
+export type ParseReviewSnapshot = {
+  active_parse_id: string; revision: number;
+  versions: { parse_id: string; provider: string; provider_model: string; status: string;
+    active: boolean; can_activate: boolean; requires_indexing: boolean;
+    quality_score: number | null; quality_decision: string | null;
+    page_count: number | null; chunk_count: number | null }[];
+  history: { review_id: string; actor_id: string; parse_id: string; previous_parse_id: string;
+    revision: number; reason: string; force: boolean | number; created_at: string }[];
+};
+export type ParseActivationInput = {
+  expected_revision: number; expected_parse_id: string; reason: string; force: boolean;
+};
 export type Workspace = {
   workspace_id: string;
   name: string;
@@ -116,6 +128,14 @@ export class WorkspaceApi {
   profile(signal: AbortSignal) { return this.json<Profile>("/api/me", { signal }); }
   workspaces(signal: AbortSignal) { return this.json<Workspace[]>("/api/workspaces", { signal }); }
   logout() { return this.#perform("/api/me/session", { method: "DELETE" }, async (response) => response); }
+  parseReview(ws: string, doc: string, signal: AbortSignal) {
+    return this.json<ParseReviewSnapshot>(this.path(ws, `/documents/${encodeURIComponent(doc)}/parse-review`), { signal });
+  }
+  activateParse(ws: string, doc: string, parse: string, input: ParseActivationInput, signal: AbortSignal) {
+    return this.json<{ review_id: string; active_parse_id: string; revision: number }>(
+      this.path(ws, `/documents/${encodeURIComponent(doc)}/parses/${encodeURIComponent(parse)}/activate`),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input), signal });
+  }
 
   path(workspaceId: string, suffix: string) {
     return `/api/workspaces/${encodeURIComponent(workspaceId)}${suffix}`;

@@ -23,6 +23,7 @@ from scholarrag.rag.runs import (
     TraceEvent,
     utc_now,
 )
+from scholarrag.storage.scheduling import claim_fair_candidate
 
 EvaluationJobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 
@@ -407,12 +408,15 @@ class EvaluationJobStore:
     def claim_next(self, worker_id):
         with self.database.transaction() as connection:
             now = time.time()
-            row = connection.execute(
-                """SELECT * FROM evaluation_job_snapshots WHERE namespace<>''
+            row = claim_fair_candidate(
+                connection,
+                "evaluation",
+                """SELECT *,namespace AS workspace_id,job_id AS scheduling_id
+                FROM evaluation_job_snapshots WHERE namespace<>''
                 AND status IN ('queued','running') AND (lease_token IS NULL OR lease_until<=?)
-                ORDER BY created_at,job_id LIMIT 1""",
+                """,
                 (now,),
-            ).fetchone()
+            )
             if not row:
                 return None
             token = uuid.uuid4().hex

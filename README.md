@@ -152,7 +152,7 @@ uv run scholarrag worker --kind ingestion
 uv run scholarrag worker --kind evaluation
 ```
 
-未启动对应 Worker 时，工作空间问答或上传保持排队；API 重启不会改写正在执行的工作空间任务。所有 Worker 使用相同 `.env`、数据目录和 Qdrant 服务。评测入口位于已完成的问答下方；默认 `local` 阅读/问答仍由 API 执行。
+未启动对应 Worker 时，工作空间问答或上传保持排队；API 重启不会改写正在执行的工作空间任务。三类队列各自按空间、用户轮转领取，调度顺序跨进程持久化；详见 [A24](docs/implementation/A24_FAIR_WORKSPACE_SCHEDULING.md)。所有 Worker 使用相同 `.env`、数据目录和 Qdrant 服务。评测入口位于已完成的问答下方；默认 `local` 阅读/问答仍由 API 执行。
 
 开发结构已更新，不迁移旧摄取任务。旧开发库缺少租约/检查点字段时会明确拒绝启动，请使用新的 `SCHOLARRAG_DATA_DIR`；旧数据不会被自动删除。详情见 [A22](docs/implementation/A22_DURABLE_INGESTION_WORKER.md)。
 
@@ -410,6 +410,8 @@ docker compose build
 3. 运行 Python 与 Web 验证命令；
 4. 在 PR 中说明 API 成本、数据迁移和兼容性影响。
 
+工作空间还提供[解析版本审核](docs/implementation/A25_WORKSPACE_PARSE_REVIEW.md)：查看质量、追踪审核人，由 Owner/Admin 切换已注册版本；未注册候选暂不支持激活。
+
 ## 当前边界与路线
 
 - 当前为开发中的多用户工作空间应用，已有令牌登录、授权查询、个人阅读管理与独立问答/摄取/评测 Worker；供应商、索引与评测指标检查点支持保守恢复；
@@ -417,7 +419,7 @@ docker compose build
 - Parser Gold、QA reviewed set 和 Judge-human correlation 仍需真实人员完成；
 - PP-StructureV3 目前只用于对照，不在生产主链；
 - 视觉证据的消融评测（文本 vs 文本+图）需要积累真实 query runs 后产出结论；
-- 后续重点是跨实例预算与公平调度、索引批次级检查点、OIDC、PostgreSQL、对象存储和恢复演练。
+- 后续重点是 OIDC、候选解析准备、供应商容量与速率控制、索引批次级检查点、OIDC、PostgreSQL、对象存储和恢复演练。
 
 ## 常见问题
 

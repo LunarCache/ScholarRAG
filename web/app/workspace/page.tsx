@@ -10,6 +10,7 @@ import { ThemeToggle } from "../ThemeToggle";
 import styles from "./workspace.module.css";
 import { WorkspaceChat } from "./WorkspaceChat";
 import { WorkspacePersonal } from "./WorkspacePersonal";
+import { WorkspaceParseReview } from "./WorkspaceParseReview";
 
 const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 const roleNames = { viewer: "只读成员", member: "成员", admin: "管理员", owner: "所有者" };
@@ -174,7 +175,7 @@ export default function WorkspacePage() {
 
 function WorkspaceContent({ workspace, client, onExpired }: { workspace: Workspace; client: WorkspaceApi; onExpired: () => void }) {
   const [papers, setPapers] = useState<WorkspacePaper[]>([]);
-  const [view, setView] = useState<"library" | "research" | "reading">("library");
+  const [view, setView] = useState<"library" | "research" | "reading" | "review">("library");
   const [researchScope, setResearchScope] = useState<{ ids: string[]; revision: number } | null>(null);
   const [activeQuery, setActiveQuery] = useState(false);
   const [jobs, setJobs] = useState<IngestionJob[]>([]);
@@ -300,6 +301,7 @@ function WorkspaceContent({ workspace, client, onExpired }: { workspace: Workspa
         <button aria-pressed={view === "library"} onClick={() => setView("library")}>论文与上传</button>
         <button aria-pressed={view === "research"} onClick={() => setView("research")}>论文问答</button>
         <button aria-pressed={view === "reading"} onClick={() => setView("reading")}>阅读与集合</button>
+        <button aria-pressed={view === "review"} onClick={() => setView("review")}>解析审核</button>
       </nav>
       <div className={styles.quickStats}>
         <span className={styles.badge}>{papers.length} 篇论文 · {totalChunks} 检索片段</span>
@@ -386,6 +388,9 @@ function WorkspaceContent({ workspace, client, onExpired }: { workspace: Workspa
                 if (paper) void openPdf(paper, page, true);
               }}
             />
+          </div>
+          <div hidden={view !== "review"}>
+            <WorkspaceParseReview client={client} workspace={workspace} papers={papers} onError={failed} onChanged={() => setRevision((value) => value + 1)} />
           </div>
           <div hidden={view !== "reading"}>
             <WorkspacePersonal

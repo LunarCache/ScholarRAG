@@ -213,3 +213,19 @@ test("evaluation reads, history, events and cancellation stay in the selected wo
     { url: `${base}/api/workspaces/ws-two/evaluations/evjob-test/cancel`, method: "POST" },
   ]);
 });
+
+test("parse review uses scoped URLs and sends conflict revision without an actor", async () => {
+  const seen = [];
+  const client = new WorkspaceApi(base, "token", async (url, init) => {
+    seen.push({ url, init }); return json({ revision: 2 });
+  });
+  await client.parseReview("ws-a", "doc/a", signal());
+  const input = { expected_revision: 1, expected_parse_id: "parse-new", reason: "reviewed", force: false };
+  await client.activateParse("ws-a", "doc/a", "parse/old", input, signal());
+  assert.equal(seen[0].url, `${base}/api/workspaces/ws-a/documents/doc%2Fa/parse-review`);
+  assert.equal(seen[1].url, `${base}/api/workspaces/ws-a/documents/doc%2Fa/parses/parse%2Fold/activate`);
+  assert.equal(seen[1].init.method, "POST");
+  assert.deepEqual(JSON.parse(seen[1].init.body), input);
+  assert.equal(seen[1].init.headers.get("Content-Type"), "application/json");
+  assert.equal(seen[1].init.cache, "no-store");
+});

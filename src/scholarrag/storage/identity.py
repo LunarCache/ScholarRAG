@@ -17,6 +17,7 @@ from contextlib import contextmanager
 
 from scholarrag.config import Settings
 from scholarrag.domain.access import AccessContext, AccessDenied, IdentityConflict, Principal, Role
+from scholarrag.storage.scheduling import initialize_scheduling
 
 _PERMISSIONS = {
     "read": set(Role),
@@ -38,6 +39,7 @@ class IdentityStore:
         self.path = settings.sqlite_path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._transaction() as connection:
+            initialize_scheduling(connection)
             # Development schema: do not silently rewrite or discard old tasks.
             columns = {row[1] for row in connection.execute("PRAGMA table_info(ingestion_jobs)")}
             if columns and "checkpoint" not in columns:

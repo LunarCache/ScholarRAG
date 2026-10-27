@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from scholarrag.config import Settings
 from scholarrag.domain.models import Answer
 from scholarrag.observability import observe
+from scholarrag.storage.scheduling import claim_fair_candidate, initialize_scheduling
 
 RunStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 StageStatus = Literal["pending", "running", "success", "skipped", "warning", "failed", "cancelled"]
@@ -319,6 +320,7 @@ class QueryRunStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = settings.sqlite_path
         with self.transaction() as connection:
+            initialize_scheduling(connection)
             connection.execute("""CREATE TABLE IF NOT EXISTS query_run_snapshots (
                 run_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, owner_id TEXT,
                 status TEXT NOT NULL, created_at TEXT NOT NULL, payload TEXT NOT NULL,
@@ -612,15 +614,18 @@ class QueryRunStore:
         """Atomically acquire queued or expired work; only registered workspace runs."""
         with self.transaction() as connection:
             now = time.time()
-            row = connection.execute(
-                """SELECT q.* FROM query_run_snapshots q
+            row = claim_fair_candidate(
+                connection,
+                "query",
+                """SELECT q.*,q.namespace AS workspace_id,q.run_id AS scheduling_id
+                FROM query_run_snapshots q
                 JOIN auth_query_runs a ON a.run_id=q.run_id AND a.workspace_id=q.namespace
                 WHERE q.namespace<>'' AND (q.status='queued' OR
                     (q.status='running' AND COALESCE(q.lease_until,0)<=?))
                 AND (q.lease_token IS NULL OR COALESCE(q.lease_until,0)<=?)
-                ORDER BY q.created_at,q.run_id LIMIT 1""",
+                """,
                 (now, now),
-            ).fetchone()
+            )
             if row is None:
                 return None
             token = uuid.uuid4().hex

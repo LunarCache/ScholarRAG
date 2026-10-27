@@ -35,6 +35,7 @@ from scholarrag.evaluation.workspaces import (
     WorkspaceEvaluations,
     public_evaluation,
 )
+from scholarrag.ingestion.workspace_reviews import WorkspaceParseActivation, WorkspaceParseReviews
 from scholarrag.ingestion.workspaces import WorkspaceIngestions
 from scholarrag.rag.workspaces import WorkspaceQueries, public_run
 from scholarrag.storage.artifacts import ArtifactStore
@@ -63,6 +64,7 @@ def workspace_router(
     evaluations: WorkspaceEvaluations,
 ) -> APIRouter:
     library = WorkspaceLibrary(identities)
+    parse_reviews = WorkspaceParseReviews(settings, identities)
 
     def principal(request: Request) -> Principal:
         if settings.auth_mode != "session":
@@ -203,6 +205,24 @@ def workspace_router(
             }
             for doc in catalog.list_documents(sorted(allowed))
         ]
+
+    @router.get("/workspaces/{workspace_id}/documents/{document_id}/parse-review")
+    def parse_review(
+        workspace_id: str, document_id: str, identity: Principal = identity_dependency
+    ):
+        return parse_reviews.snapshot(identities.context_for(identity, workspace_id), document_id)
+
+    @router.post("/workspaces/{workspace_id}/documents/{document_id}/parses/{parse_id}/activate")
+    def activate_parse(
+        workspace_id: str,
+        document_id: str,
+        parse_id: str,
+        body: WorkspaceParseActivation,
+        identity: Principal = identity_dependency,
+    ):
+        return parse_reviews.activate(
+            identities.context_for(identity, workspace_id), document_id, parse_id, body
+        )
 
     @router.get("/workspaces/{workspace_id}/documents/{document_id}/pdf")
     def pdf(
